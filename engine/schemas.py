@@ -178,17 +178,12 @@ def detect_schema_type(columns: List[str]) -> str:
     return "generic_retail"
 
 
-def map_columns(df: DataFrame) -> Dict[str, str]:
-    """Match each canonical field to at most one source column.
-
-    Pass 1: exact alias match. Pass 2: a column name that starts or ends with an alias
-    (e.g. "order date (DateOrders)" starts with "orderdate"). Pass 3 (dates only): the
-    column whose values parse as dates most often.
-    """
+def map_column_names(columns: List[str]) -> Dict[str, str]:
+    """Name-only part of `map_columns` (passes 1 and 2); usable on a CSV header without Spark."""
     keys: Dict[str, str] = {}
-    for c in df.columns:
+    for c in columns:
         keys.setdefault(_norm(c), c)
-    for c in df.columns:  # "Price2" (Spark's rename of a duplicate header), "category_name_1"
+    for c in columns:  # "Price2" (Spark's rename of a duplicate header), "category_name_1"
         keys.setdefault(_norm(c).rstrip("0123456789"), c)
     used: set[str] = set()
     mapping: Dict[str, str] = {}
@@ -203,6 +198,28 @@ def map_columns(df: DataFrame) -> Dict[str, str]:
         if hit is not None:
             mapping[field] = hit
             used.add(hit)
+    return mapping
+
+
+def best_sales_file(paths: List[Path]) -> Path | None:
+    """Among files uploaded together, the one whose header maps to the most sales fields."""
+    scored = []
+    for p in paths:
+        header = _header_of(p)
+        m = map_column_names(header)
+        scored.append((_has_core_fields(m), len(m), p.stat().st_size, p))
+    return max(scored, key=lambda s: s[:3])[3] if scored else None
+
+
+def map_columns(df: DataFrame) -> Dict[str, str]:
+    """Match each canonical field to at most one source column.
+
+    Pass 1: exact alias match. Pass 2: a column name that starts or ends with an alias
+    (e.g. "order date (DateOrders)" starts with "orderdate"). Pass 3 (dates only): the
+    column whose values parse as dates most often.
+    """
+    mapping = map_column_names(df.columns)
+    used = set(mapping.values())
     if "invoice_date" not in mapping:
         guess = _guess_date_column(df, used)
         if guess:
@@ -583,6 +600,15 @@ def _load_olist_folder(spark: SparkSession, folder: Path) -> Tuple[DataFrame, in
     """Join Olist's relational CSV tables; payments and reviews are joined when present."""
     orders = _csv(spark, folder / "olist_orders_dataset.csv")
     items = _csv(spark, folder / "olist_order_items_dataset.csv")
+    # Olist stores "2 x product" as two identical item rows (order_item_id 1, 2). Collapse them into
+    # one line with a quantity, otherwise Silver de-duplication would delete the repeat purchases.
+    item_dt = {f.name: f.dataType for f in items.schema.fields}
+    item_aggs = [F.count(F.lit(1)).alias("item_qty")]
+    if "seller_id" in item_dt:
+        item_aggs.append(F.first(_str(_c("seller_id")), ignorenulls=True).alias("seller_id"))
+    if "freight_value" in item_dt:
+        item_aggs.append(F.sum(_num(_c("freight_value"), item_dt["freight_value"])).alias("freight_value"))
+    items = items.groupBy("order_id", "product_id", "price").agg(*item_aggs)
     customers = _csv(spark, folder / "olist_customers_dataset.csv")
     products = _csv(spark, folder / "olist_products_dataset.csv")
     joined = (
@@ -650,7 +676,7 @@ def _load_olist_folder(spark: SparkSession, folder: Path) -> Tuple[DataFrame, in
         F.when(is_canceled, F.concat(F.lit("C"), order_id)).otherwise(order_id).alias("invoice_no"),
         _str(_c("product_id")).alias("stock_code"),
         F.coalesce(category, _str(_c("product_id"))).alias("description"),
-        F.when(is_canceled, F.lit(-1)).otherwise(F.lit(1)).alias("quantity"),
+        F.when(is_canceled, -F.col("item_qty")).otherwise(F.col("item_qty")).alias("quantity"),
         purchased.alias("invoice_date"),
         _num(_c("price"), dtypes["price"]).alias("unit_price"),
         _str(_c("customer_unique_id")).alias("customer_id"),

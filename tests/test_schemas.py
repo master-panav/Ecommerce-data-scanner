@@ -62,6 +62,15 @@ def test_data_dictionary_redirects_to_the_dataset_it_describes(spark, tmp_path):
     assert df.count() == 2
 
 
+def test_best_sales_file_skips_dictionaries_and_logs(tmp_path):
+    from engine.schemas import best_sales_file
+
+    pd.DataFrame({"FIELDS": ["Sales"], "DESCRIPTION": ["x"]}).to_csv(tmp_path / "Description.csv", index=False)
+    pd.DataFrame({"Product": ["a"] * 50, "Date": ["9/1/2017 6:00"] * 50, "ip": ["1.1.1.1"] * 50}).to_csv(tmp_path / "logs.csv", index=False)
+    pd.DataFrame({"order date (DateOrders)": ["1/31/2018 22:56"], "Order Id": [1], "Sales": [9.5]}).to_csv(tmp_path / "Data.csv", index=False)
+    assert best_sales_file(sorted(tmp_path.glob("*.csv"))).name == "Data.csv"
+
+
 def test_excel_with_mixed_invoice_column(spark, tmp_path):
     path = tmp_path / "mixed.xlsx"
     pd.DataFrame(

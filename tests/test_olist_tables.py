@@ -21,6 +21,20 @@ def test_lone_translation_table_names_the_missing_tables(spark, tmp_path):
         load_raw_dataset(spark, tmp_path / "product_category_name_translation.csv")
 
 
+def test_repeated_olist_items_become_a_quantity_not_duplicates(spark, tmp_path):
+    generate_olist_sample(tmp_path, n_orders=50, seed=3)
+    items = pd.read_csv(tmp_path / "olist_order_items_dataset.csv")
+    first = items.iloc[[0]].copy()
+    first["order_item_id"] = 99  # same order, product and price bought a second time
+    pd.concat([items, first]).to_csv(tmp_path / "olist_order_items_dataset.csv", index=False)
+
+    df, _, _ = load_raw_dataset(spark, tmp_path)
+    row = df.filter((df.invoice_no.endswith(first.order_id.iloc[0])) & (df.stock_code == first.product_id.iloc[0])).collect()
+    assert len(row) == 1 and abs(row[0].quantity) == 2
+    # Total units equal the number of item rows (cancelled orders are negative)
+    assert df.selectExpr("sum(abs(quantity))").first()[0] == len(items) + 1
+
+
 def test_any_olist_table_loads_the_whole_set_with_english_categories(spark, tmp_path):
     generate_olist_sample(tmp_path, n_orders=200, seed=1)
     _translation(tmp_path)

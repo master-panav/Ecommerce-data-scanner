@@ -34,7 +34,7 @@ from engine.analytics import (
 from engine.forecasting import MEASURES, cohort_analysis, forecast_monthly
 from engine.ml_models import run_fpgrowth_basket, run_kmeans_segmentation
 from engine.pipeline import EmptySilverError, PipelineAudit, load_saved_audits, load_silver, run_medallion_etl
-from engine.schemas import OLIST_FILE_RE, DATASET_CATALOG, SchemaMappingError, is_multi_table_folder
+from engine.schemas import OLIST_FILE_RE, DATASET_CATALOG, SchemaMappingError, best_sales_file, is_multi_table_folder
 from engine.spark_session import get_spark, get_spark_telemetry, set_shuffle_partitions
 
 APP_DIR = Path(__file__).resolve().parent
@@ -255,10 +255,20 @@ if page == "1. Pipeline & Spark Monitor":
                 help="Saved into data_lake/bronze/. Kaggle ZIPs are extracted; Olist CSVs can be uploaded together "
                 "and are joined automatically. For multi-GB files, copy them there directly.",
             )
+            already_saved = set(st.session_state.get("saved_upload_ids", set()))
+            new_names = []
             for uploaded in uploads or []:
-                save_upload(uploaded)
+                name = save_upload(uploaded)
+                if (getattr(uploaded, "file_id", None) or f"{uploaded.name}:{uploaded.size}") not in already_saved:
+                    new_names.append(name)
             if uploads:
                 sources = discover_bronze_sources()
+                # Several plain files added at once (e.g. a Kaggle download's CSVs): select the main
+                # sales table rather than whichever file happened to be last
+                batch = [sources[n] for n in dict.fromkeys(new_names) if n in sources and sources[n].is_file()]
+                if len(batch) > 1 and st.session_state.get("bronze_choice") in new_names:
+                    best = best_sales_file(batch)
+                    st.session_state["bronze_choice"] = next(n for n in new_names if sources.get(n) == best)
 
         if sources:
             names = list(sources.keys())
