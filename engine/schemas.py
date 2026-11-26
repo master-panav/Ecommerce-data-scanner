@@ -1,12 +1,16 @@
 """Bronze ingestion: read, pre-clean and normalise any e-commerce dataset for PySpark.
 
-Works with the five public datasets below and with arbitrary retail/clickstream files:
-headers are cleaned, placeholder values become NULL, empty rows/columns are dropped,
-columns are matched by flexible name aliases, and every conversion is cast-safe
-(bad values become NULL instead of crashing under ANSI mode). The output is one
-canonical transaction schema used by all Silver/Gold analytics and Spark MLlib models:
-    invoice_no, stock_code, description, quantity, invoice_date,
-    unit_price, customer_id, country, event_type, category
+Works with the public datasets in DATASET_CATALOG and with arbitrary retail, supply-chain or
+clickstream files (including wide 20-50+ column exports):
+  * headers are cleaned, placeholder values become NULL, empty rows/columns are dropped;
+  * every column is profiled (type, nulls, distinct values);
+  * canonical fields are matched by flexible name aliases, with a value-based fallback for dates;
+  * every conversion is cast-safe (bad values become NULL instead of crashing under ANSI mode);
+  * all columns that are not mapped are kept as `x_<name>` attributes for slice-and-dice BI.
+
+Canonical transaction schema used by the Silver/Gold layers and Spark MLlib models:
+    invoice_no, stock_code, description, quantity, invoice_date, unit_price, customer_id,
+    country, event_type, category, order_status, profit, discount, source_total, x_*
 """
 
 from __future__ import annotations
@@ -14,7 +18,7 @@ from __future__ import annotations
 import gzip
 import re
 from pathlib import Path
-from typing import Dict, Tuple
+from typing import Dict, List, Tuple
 
 import pandas as pd
 from pyspark.sql import Column, DataFrame, SparkSession, functions as F
@@ -42,7 +46,28 @@ DATASET_CATALOG: Dict[str, Dict[str, str]] = {
         "rows": "~100,000+ orders",
         "size": "~45 MB (9 CSVs)",
         "url": "https://www.kaggle.com/datasets/olistbr/brazilian-ecommerce",
-        "focus": "Distributed multi-table Spark Joins & regional BI",
+        "focus": "Distributed multi-table Spark Joins, delivery & review BI",
+    },
+    "dataco_supply_chain": {
+        "name": "DataCo Smart Supply Chain",
+        "rows": "~180,000 order items, 53 columns",
+        "size": "~95 MB (.csv)",
+        "url": "https://www.kaggle.com/datasets/shashwatwork/dataco-smart-supply-chain-for-big-data-analysis",
+        "focus": "Wide-table BI: profit, shipping delays, markets & segments",
+    },
+    "pakistan_ecommerce": {
+        "name": "Pakistan's Largest E-Commerce Dataset",
+        "rows": "~580,000 orders",
+        "size": "~100 MB (.csv)",
+        "url": "https://www.kaggle.com/datasets/zusmani/pakistans-largest-ecommerce-dataset",
+        "focus": "Order-status cancellations/refunds, payment methods",
+    },
+    "superstore_sales": {
+        "name": "SuperStore Sales",
+        "rows": "~50,000 order lines",
+        "size": "~8 MB (.csv)",
+        "url": "https://www.kaggle.com/datasets/laibaanwer/superstore-sales-dataset",
+        "focus": "Profit & discount analysis by segment, market, ship mode",
     },
     "rees46_clickstream": {
         "name": "REES46 Multi-Category Clickstream",
@@ -67,26 +92,37 @@ class SchemaMappingError(ValueError):
 
 # --------------------------------------------------------------------------------------
 # Flexible column mapping. Names are compared after lower-casing and removing everything
-# that is not a letter or digit, so "Invoice No", "invoice-no" and "InvoiceNo" all match.
+# that is not a letter or digit, so "Order Item Quantity", "order_item_quantity" and
+# "OrderItemQuantity" all match. Aliases are listed in priority order.
 # --------------------------------------------------------------------------------------
 FIELD_ALIASES: Dict[str, Tuple[str, ...]] = {
     "event_type": ("eventtype", "event", "action", "eventname", "interactiontype"),
-    "invoice_date": ("invoicedate", "orderdate", "date", "datetime", "timestamp", "transactiondate", "purchasedate",
-                     "eventtime", "orderpurchasetimestamp", "time", "createdat", "orderdatetime"),
-    "invoice_no": ("invoiceno", "invoice", "invoiceid", "invoicenumber", "orderid", "orderno", "ordernumber", "order",
-                   "transactionid", "transactionno", "transaction", "receiptno", "billno"),
+    "invoice_date": ("invoicedate", "orderdate", "orderdatedateorders", "orderpurchasetimestamp", "purchasedate",
+                     "transactiondate", "createdat", "orderdatetime", "eventtime", "date", "datetime", "timestamp", "time"),
+    "invoice_no": ("invoiceno", "invoice", "invoiceid", "invoicenumber", "orderid", "orderno", "ordernumber",
+                   "incrementid", "transactionid", "transactionno", "receiptno", "billno"),
     "session": ("usersession", "sessionid", "session"),
-    "customer_id": ("customerid", "customeruniqueid", "customer", "customerno", "customernumber", "clientid", "userid",
-                    "buyerid", "memberid"),
-    "stock_code": ("stockcode", "productid", "productcode", "productno", "sku", "itemid", "itemcode", "asin", "articleno"),
-    "quantity": ("quantity", "qty", "units", "unitssold", "quantityordered", "orderquantity"),
-    "unit_price": ("unitprice", "price", "priceeach", "itemprice", "sellingprice", "saleprice", "rate", "mrp"),
-    "line_total": ("totalprice", "linetotal", "totalamount", "total", "amount", "sales", "revenue", "saleamount", "ordervalue"),
-    "description": ("description", "productname", "product", "itemname", "item", "title", "productdescription", "brand"),
-    "country": ("country", "countryname", "region", "state", "city", "market", "location"),
-    "category": ("category", "categorycode", "productcategory", "categoryname", "department", "productline", "segment"),
+    "customer_id": ("customerid", "customeruniqueid", "ordercustomerid", "customerno", "customernumber", "clientid",
+                    "userid", "buyerid", "memberid", "customername", "customer"),
+    "stock_code": ("stockcode", "productid", "productcardid", "productcode", "productno", "sku", "itemid", "itemcode",
+                   "asin", "articleno"),
+    "quantity": ("quantity", "qty", "qtyordered", "orderitemquantity", "quantityordered", "orderquantity", "units",
+                 "unitssold"),
+    "unit_price": ("unitprice", "price", "orderitemproductprice", "productprice", "priceeach", "itemprice",
+                   "sellingprice", "saleprice", "mrp"),
+    "line_total": ("orderitemtotal", "linetotal", "totalprice", "grandtotal", "totalamount", "total", "amount", "sales",
+                   "revenue", "saleamount", "ordervalue"),
+    "profit": ("profit", "orderprofitperorder", "benefitperorder", "netprofit", "grossprofit"),
+    "discount": ("discount", "discountamount", "orderitemdiscount", "discountvalue"),
+    "status": ("orderstatus", "status", "deliverystatus"),
+    "description": ("description", "productname", "itemname", "itemdescription", "product", "item", "title", "brand"),
+    "country": ("country", "ordercountry", "countryname", "customercountry", "region", "orderregion", "state", "city",
+                "market", "location"),
+    "category": ("category", "categoryname", "productcategory", "productcategoryname", "categorycode", "department",
+                 "departmentname", "productline", "segment"),
 }
-NULL_TOKENS = ("", "nan", "null", "none", "na", "n/a", "nat", "-", "?")
+CANCEL_STATUS_RE = r"cancel|refund|return|reject|void"
+NULL_TOKENS = ("", "nan", "null", "none", "na", "n/a", "nat", "-", "?", "#n/a")
 EVENT_SYNONYMS = {
     "purchase": ("purchase", "buy", "order", "checkout", "transaction", "sale"),
     "cart": ("cart", "addtocart", "add_to_cart", "add-to-cart"),
@@ -97,15 +133,25 @@ TIMESTAMP_FORMATS = (
     "yyyy-MM-dd HH:mm:ss", "yyyy-MM-dd HH:mm", "yyyy-MM-dd", "yyyy/MM/dd HH:mm:ss", "yyyy/MM/dd",
     "M/d/yyyy H:mm:ss", "M/d/yyyy H:mm", "M/d/yyyy", "M/d/yy H:mm", "M/d/yy",
     "d/M/yyyy H:mm:ss", "d/M/yyyy H:mm", "d/M/yyyy", "d-M-yyyy H:mm", "d-M-yyyy", "dd.MM.yyyy HH:mm", "dd.MM.yyyy",
+    "d-MMM-yyyy", "d-MMM-yy", "d MMM yyyy", "MMM d, yyyy", "MMMM d, yyyy",
 )
 _NUMBER_RE = r"^[+-]?(\d+\.?\d*|\.\d+)([eE][+-]?\d+)?$"
+MAX_EXTRA_COLUMNS = 80
 
 
 def _norm(name: str) -> str:
     return re.sub(r"[^a-z0-9]", "", str(name).lower())
 
 
-def detect_schema_type(columns: list[str]) -> str:
+def _snake(name: str) -> str:
+    return re.sub(r"[^0-9a-zA-Z]+", "_", str(name)).strip("_").lower() or "col"
+
+
+def _c(name: str) -> Column:
+    return F.col(f"`{name}`")
+
+
+def detect_schema_type(columns: List[str]) -> str:
     """Label the source schema (for display only; the mapping itself is generic)."""
     raw = {c.strip().lower() for c in columns}
     keys = {_norm(c) for c in columns}
@@ -115,6 +161,12 @@ def detect_schema_type(columns: list[str]) -> str:
         return "rees46_clickstream"
     if keys & set(FIELD_ALIASES["event_type"]):
         return "clickstream"
+    if {"orderitemquantity", "deliverystatus"} <= keys:
+        return "dataco_supply_chain"
+    if {"incrementid", "qtyordered"} <= keys:
+        return "pakistan_ecommerce"
+    if {"subcategory", "profit"} <= keys and ("shipmode" in keys or "segment" in keys):
+        return "superstore_sales"
     if {"orderid", "productid", "addtocartorder"} <= keys:
         return "instacart_basket"
     if {"orderid", "orderitemid", "price"} <= keys:
@@ -127,25 +179,68 @@ def detect_schema_type(columns: list[str]) -> str:
 
 
 def map_columns(df: DataFrame) -> Dict[str, str]:
-    """Match each canonical field to at most one source column: exact alias first, then containment."""
+    """Match each canonical field to at most one source column.
+
+    Pass 1: exact alias match. Pass 2: a column name that starts or ends with an alias
+    (e.g. "order date (DateOrders)" starts with "orderdate"). Pass 3 (dates only): the
+    column whose values parse as dates most often.
+    """
     keys: Dict[str, str] = {}
     for c in df.columns:
         keys.setdefault(_norm(c), c)
+    for c in df.columns:  # "Price2" (Spark's rename of a duplicate header), "category_name_1"
+        keys.setdefault(_norm(c).rstrip("0123456789"), c)
     used: set[str] = set()
     mapping: Dict[str, str] = {}
     for field, aliases in FIELD_ALIASES.items():
         hit = next((keys[a] for a in aliases if a in keys and keys[a] not in used), None)
-        if hit is None:  # e.g. "Order Date (UTC)" -> "orderdateutc" contains "orderdate"
-            hit = next((c for a in aliases if len(a) >= 5 for k, c in keys.items() if a in k and c not in used), None)
+        if hit is None:
+            hit = next(
+                (c for a in aliases if len(a) >= 6 for k, c in keys.items()
+                 if (k.startswith(a) or k.endswith(a)) and c not in used),
+                None,
+            )
         if hit is not None:
             mapping[field] = hit
             used.add(hit)
-    if "invoice_date" not in mapping:  # fall back to the first real date/time column
-        for f in df.schema.fields:
-            if isinstance(f.dataType, (TimestampType, DateType)) and f.name not in used:
-                mapping["invoice_date"] = f.name
-                break
+    if "invoice_date" not in mapping:
+        guess = _guess_date_column(df, used)
+        if guess:
+            mapping["invoice_date"] = guess
     return mapping
+
+
+def _guess_date_column(df: DataFrame, used: set[str]) -> str | None:
+    """Pick the column whose sampled values parse as timestamps most often (>= 80%)."""
+    fields = [f for f in df.schema.fields if f.name not in used]
+    for f in fields:
+        if isinstance(f.dataType, (TimestampType, DateType)):
+            return f.name
+    candidates = [f.name for f in fields if isinstance(f.dataType, StringType)]
+    if not candidates:
+        return None
+    sample = df.select([_c(c) for c in candidates]).limit(500)
+    row = sample.agg(*[
+        (F.count(_ts(_c(c), StringType())) / F.greatest(F.count(_c(c)), F.lit(1))).alias(f"r{i}")
+        for i, c in enumerate(candidates)
+    ]).collect()[0]
+    best = max(range(len(candidates)), key=lambda i: row[f"r{i}"] or 0)
+    return candidates[best] if (row[f"r{best}"] or 0) >= 0.8 else None
+
+
+def extra_columns(df: DataFrame, mapping: Dict[str, str]) -> Dict[str, str]:
+    """Unmapped source columns kept as attributes: {"x_<snake_name>": "Original Name"}."""
+    used = set(mapping.values())
+    out: Dict[str, str] = {}
+    for c in df.columns:
+        if c in used or len(out) >= MAX_EXTRA_COLUMNS:
+            continue
+        base = f"x_{_snake(c)}"
+        name, i = base, 2
+        while name in out:
+            name, i = f"{base}_{i}", i + 1
+        out[name] = c
+    return out
 
 
 # --------------------------------------------------------------------------------------
@@ -166,7 +261,7 @@ def _num(col: Column, dtype) -> Column:
         return col.cast(DoubleType())
     s = _str(col)
     s = F.regexp_replace(s, r"^(-?\d+),(\d{1,2})$", "$1.$2")  # decimal comma: "12,50"
-    s = F.regexp_replace(s, r"[^0-9eE+\-.]", "")  # currency symbols, thousands separators, spaces
+    s = F.regexp_replace(s, r"[^0-9eE+\-.]", "")  # currency symbols, thousands separators, spaces, %
     return F.when(s.rlike(_NUMBER_RE), s).cast(DoubleType())
 
 
@@ -179,9 +274,9 @@ def _ts(col: Column, dtype) -> Column:
 
 
 # --------------------------------------------------------------------------------------
-# Bronze pre-cleaning (runs before any mapping or analytics)
+# Bronze pre-cleaning and column profiling (runs before any mapping or analytics)
 # --------------------------------------------------------------------------------------
-def _clean_headers(columns: list[str]) -> list[str]:
+def _clean_headers(columns: List[str]) -> List[str]:
     seen: Dict[str, int] = {}
     out = []
     for i, c in enumerate(columns):
@@ -194,25 +289,41 @@ def _clean_headers(columns: list[str]) -> list[str]:
 
 def clean_bronze(df: DataFrame, profile: bool = True) -> Tuple[DataFrame, Dict[str, object]]:
     """Fix headers, trim text, turn placeholders ("", "NaN", "null", "N/A"...) into NULL and
-    drop fully empty columns and rows. Returns the cleaned frame and what was removed."""
+    drop fully empty columns and rows. With profile=True also returns a per-column profile."""
     df = df.toDF(*_clean_headers(df.columns))
     string_cols = {f.name for f in df.schema.fields if isinstance(f.dataType, StringType)}
     df = df.select([
-        F.when(F.lower(F.trim(F.col(f"`{c}`"))).isin(*NULL_TOKENS), None).otherwise(F.trim(F.col(f"`{c}`"))).alias(c)
-        if c in string_cols else F.col(f"`{c}`")
+        F.when(F.lower(F.trim(_c(c))).isin(*NULL_TOKENS), None).otherwise(F.trim(_c(c))).alias(c)
+        if c in string_cols else _c(c)
         for c in df.columns
     ])
-    stats: Dict[str, object] = {"empty_rows": 0, "empty_columns": []}
+    stats: Dict[str, object] = {"empty_rows": 0, "empty_columns": [], "column_profile": []}
     if profile:
         all_null = F.lit(True)
         for c in df.columns:
-            all_null = all_null & F.col(f"`{c}`").isNull()
+            all_null = all_null & _c(c).isNull()
         row = df.agg(
+            F.count(F.lit(1)).alias("__rows"),
             F.sum(F.when(all_null, 1).otherwise(0)).alias("__empty_rows"),
-            *[F.count(F.col(f"`{c}`")).alias(f"__nn_{i}") for i, c in enumerate(df.columns)],
+            *[F.count(_c(c)).alias(f"__nn_{i}") for i, c in enumerate(df.columns)],
+            *[F.approx_count_distinct(_c(c)).alias(f"__nd_{i}") for i, c in enumerate(df.columns)],
         ).collect()[0]
-        stats["empty_rows"] = int(row["__empty_rows"] or 0)
+        total = int(row["__rows"] or 0)
+        empty_rows = int(row["__empty_rows"] or 0)
+        kept_rows = max(total - empty_rows, 1)
+        types = {f.name: f.dataType.simpleString() for f in df.schema.fields}
+        stats["empty_rows"] = empty_rows
         stats["empty_columns"] = [c for i, c in enumerate(df.columns) if row[f"__nn_{i}"] == 0]
+        stats["column_profile"] = [
+            {
+                "column": c,
+                "type": types[c],
+                "non_null": int(row[f"__nn_{i}"]),
+                "null_pct": round(100 * (1 - row[f"__nn_{i}"] / kept_rows), 2),
+                "distinct_approx": int(row[f"__nd_{i}"]),
+            }
+            for i, c in enumerate(df.columns)
+        ]
         if stats["empty_columns"]:
             df = df.drop(*stats["empty_columns"])
     return df.dropna(how="all"), stats
@@ -238,7 +349,7 @@ def _read_excel_to_spark(spark: SparkSession, file_path: Path) -> DataFrame:
 
 
 def _detect_text_encoding(path: Path, sample_bytes: int = 4 * 1024 * 1024) -> str:
-    """Return UTF-8 when the file decodes cleanly, else ISO-8859-1 (UCI CSV exports use Latin-1)."""
+    """Return UTF-8 when the file decodes cleanly, else ISO-8859-1 (UCI and DataCo CSVs use Latin-1)."""
     opener = gzip.open if path.suffix.lower() == ".gz" else open
     try:
         with opener(path, "rb") as fh:
@@ -257,18 +368,25 @@ def _csv(spark: SparkSession, path: Path) -> DataFrame:
     return clean_bronze(read_csv(spark, path, encoding=_detect_text_encoding(path)), profile=False)[0]
 
 
+def is_multi_table_folder(p: Path) -> bool:
+    return p.is_dir() and (
+        (p / "olist_orders_dataset.csv").exists() or ((p / "orders.csv").exists() and (p / "products.csv").exists())
+    )
+
+
 def load_raw_dataset(spark: SparkSession, path: str | Path) -> Tuple[DataFrame, str, Dict[str, object]]:
     """Read any supported source, pre-clean it and map it to the canonical schema.
 
-    Returns (canonical_df, schema_label, prep_report); prep_report holds the column mapping
-    and the empty rows/columns removed before processing.
+    Returns (canonical_df, schema_label, prep_report); prep_report holds the column mapping,
+    the kept extra columns, the per-column profile and the empty rows/columns removed.
     """
     p = Path(path)
     if not p.exists():
         raise FileNotFoundError(f"Bronze source not found: {p}")
 
     if p.is_dir() and (p / "olist_orders_dataset.csv").exists():
-        return _load_olist_folder(spark, p), "olist_brazil", {"column_mapping": {"source": "Olist 4-table join"}}
+        df, tables = _load_olist_folder(spark, p)
+        return df, "olist_brazil", {"column_mapping": {"source": f"Olist {tables}-table join"}}
     if p.is_dir() and (p / "orders.csv").exists() and (p / "products.csv").exists():
         return _load_instacart_folder(spark, p), "instacart_basket", {"column_mapping": {"source": "Instacart 3-table join"}}
 
@@ -283,41 +401,46 @@ def load_raw_dataset(spark: SparkSession, path: str | Path) -> Tuple[DataFrame, 
         elif suffix in {".csv", ".gz", ".txt"}:
             raw_df = read_csv(spark, p, encoding=_detect_text_encoding(p))
         else:
-            raise SchemaMappingError(f"Unsupported file type `{suffix}`. Use .csv, .csv.gz, .xlsx or .parquet.")
+            raise SchemaMappingError(f"Unsupported file type `{suffix}`. Use .csv, .csv.gz, .xlsx, .parquet or .zip.")
 
     clean_df, stats = clean_bronze(raw_df)
     if not clean_df.columns:
         raise SchemaMappingError(f"`{p.name}` has no non-empty columns.")
     mapping = map_columns(clean_df)
     _validate_mapping(mapping, clean_df.columns, p.name)
-    return normalize_dataframe(clean_df, mapping), detect_schema_type(clean_df.columns), {"column_mapping": mapping, **stats}
+    extras = extra_columns(clean_df, mapping)
+    report = {"column_mapping": mapping, "extra_columns": extras, **stats}
+    return normalize_dataframe(clean_df, mapping, extras), detect_schema_type(clean_df.columns), report
 
 
-def _validate_mapping(mapping: Dict[str, str], columns: list[str], source_name: str) -> None:
+def _validate_mapping(mapping: Dict[str, str], columns: List[str], source_name: str) -> None:
     missing = []
     if "invoice_date" not in mapping:
-        missing.append("a date/time column (e.g. InvoiceDate, order_date, timestamp)")
+        missing.append("a date/time column (e.g. InvoiceDate, order_date, created_at)")
     if "unit_price" not in mapping and "line_total" not in mapping:
         missing.append("a price or amount column (e.g. UnitPrice, price, total, sales)")
     if missing:
         raise SchemaMappingError(
             f"Could not recognise the columns in `{source_name}`. Missing {' and '.join(missing)}. "
-            f"Found columns: {', '.join(columns[:25])}."
+            f"Found columns: {', '.join(columns[:30])}."
         )
 
 
 # --------------------------------------------------------------------------------------
 # Canonical normalisation
 # --------------------------------------------------------------------------------------
-def normalize_dataframe(df: DataFrame, mapping: Dict[str, str]) -> DataFrame:
-    """Map any single-table retail or clickstream source into the canonical transaction schema."""
+def normalize_dataframe(df: DataFrame, mapping: Dict[str, str], extras: Dict[str, str] | None = None) -> DataFrame:
+    """Map any single-table retail, supply-chain or clickstream source into the canonical schema."""
     dtypes = {f.name: f.dataType for f in df.schema.fields}
 
     def col(field: str) -> Column:
-        return F.col(f"`{mapping[field]}`")
+        return _c(mapping[field])
 
     def dtype(field: str):
         return dtypes.get(mapping.get(field))
+
+    def num(field: str) -> Column:
+        return _num(col(field), dtype(field)) if field in mapping else F.lit(None).cast(DoubleType())
 
     ts = _ts(col("invoice_date"), dtype("invoice_date"))
     customer = _id(col("customer_id")) if "customer_id" in mapping else F.lit(None).cast(StringType())
@@ -327,12 +450,10 @@ def normalize_dataframe(df: DataFrame, mapping: Dict[str, str]) -> DataFrame:
     invoice_cols = [_id(col(f)) for f in ("invoice_no", "session") if f in mapping]
     invoice = F.coalesce(*invoice_cols) if invoice_cols else F.concat_ws("_", customer, ts.cast(StringType()))
 
-    qty = _num(col("quantity"), dtype("quantity")) if "quantity" in mapping else F.lit(1.0)
+    qty = num("quantity") if "quantity" in mapping else F.lit(1.0)
     qty_int = F.when(F.abs(qty) < 2_000_000_000, F.round(qty)).cast("int")
-    price = _num(col("unit_price"), dtype("unit_price")) if "unit_price" in mapping else F.lit(None).cast(DoubleType())
-    if "line_total" in mapping:  # derive the unit price from a line total when no price is given
-        total = _num(col("line_total"), dtype("line_total"))
-        price = F.coalesce(price, F.when(qty_int != 0, total / F.abs(qty_int)))
+    total = num("line_total")
+    price = F.coalesce(num("unit_price"), F.when(qty_int != 0, total / F.abs(qty_int)))
 
     if "event_type" in mapping:
         raw_event = F.lower(_str(col("event_type")))
@@ -342,53 +463,104 @@ def normalize_dataframe(df: DataFrame, mapping: Dict[str, str]) -> DataFrame:
     else:
         event = F.lit("purchase")
 
-    text = {f: _str(col(f)) for f in ("description", "country", "category") if f in mapping}
-    desc_parts = [text[f] for f in ("description", "category") if f in text]
+    def text(field: str) -> Column:
+        return _str(col(field)) if field in mapping else F.lit(None).cast(StringType())
+
     return df.select(
         invoice.alias("invoice_no"),
         stock.alias("stock_code"),
-        F.coalesce(*desc_parts, stock, F.lit("Unknown")).alias("description"),
+        F.coalesce(text("description"), text("category"), stock, F.lit("Unknown")).alias("description"),
         qty_int.alias("quantity"),
         ts.alias("invoice_date"),
         price.alias("unit_price"),
         customer.alias("customer_id"),
-        F.coalesce(text.get("country", F.lit(None)), F.lit("Unknown")).alias("country"),
+        F.coalesce(text("country"), F.lit("Unknown")).alias("country"),
         event.alias("event_type"),
-        F.coalesce(text.get("category", F.lit(None)), F.lit("uncategorized")).alias("category"),
+        F.coalesce(text("category"), F.lit("uncategorized")).alias("category"),
+        F.lower(text("status")).alias("order_status"),
+        num("profit").alias("profit"),
+        num("discount").alias("discount"),
+        total.alias("source_total"),
+        *[_c(src).alias(name) for name, src in (extras or {}).items()],
     )
 
 
 # --------------------------------------------------------------------------------------
 # Multi-table sources (distributed joins)
 # --------------------------------------------------------------------------------------
-def _load_olist_folder(spark: SparkSession, folder: Path) -> DataFrame:
-    """Join Olist's relational CSV tables (broadcasting the small product table)."""
+def _load_olist_folder(spark: SparkSession, folder: Path) -> Tuple[DataFrame, int]:
+    """Join Olist's relational CSV tables; payments and reviews are joined when present."""
     orders = _csv(spark, folder / "olist_orders_dataset.csv")
     items = _csv(spark, folder / "olist_order_items_dataset.csv")
     customers = _csv(spark, folder / "olist_customers_dataset.csv")
     products = _csv(spark, folder / "olist_products_dataset.csv")
-
     joined = (
         items.join(orders, on="order_id", how="inner")
         .join(customers, on="customer_id", how="left")
         .join(F.broadcast(products), on="product_id", how="left")
     )
+    tables = 4
+
+    payments_path = folder / "olist_order_payments_dataset.csv"
+    if payments_path.exists():
+        pay = _csv(spark, payments_path)
+        pay_dt = {f.name: f.dataType for f in pay.schema.fields}
+        joined = joined.join(
+            pay.groupBy("order_id").agg(
+                F.first(_str(_c("payment_type")), ignorenulls=True).alias("x_payment_type"),
+                F.max(_num(_c("payment_installments"), pay_dt.get("payment_installments"))).alias("x_payment_installments"),
+            ),
+            on="order_id", how="left",
+        )
+        tables += 1
+    reviews_path = folder / "olist_order_reviews_dataset.csv"
+    if reviews_path.exists():
+        rev = _csv(spark, reviews_path)
+        rev_dt = {f.name: f.dataType for f in rev.schema.fields}
+        joined = joined.join(
+            rev.groupBy("order_id").agg(F.avg(_num(_c("review_score"), rev_dt.get("review_score"))).alias("x_review_score")),
+            on="order_id", how="left",
+        )
+        tables += 1
+
     dtypes = {f.name: f.dataType for f in joined.schema.fields}
-    is_canceled = F.lower(_str(F.col("order_status"))).isin("canceled", "unavailable")
-    order_id = _str(F.col("order_id"))
-    category = _str(F.col("product_category_name"))
-    return joined.select(
+    purchased = _ts(_c("order_purchase_timestamp"), dtypes["order_purchase_timestamp"])
+    status = F.lower(_str(_c("order_status")))
+    is_canceled = status.isin("canceled", "unavailable")
+    order_id = _str(_c("order_id"))
+    category = _str(_c("product_category_name")) if "product_category_name" in dtypes else F.lit(None).cast(StringType())
+
+    extras = [F.col(c) for c in ("x_payment_type", "x_payment_installments", "x_review_score") if c in dtypes]
+    for src, name in (("customer_city", "x_customer_city"), ("customer_state", "x_customer_state"), ("seller_id", "x_seller_id")):
+        if src in dtypes:
+            extras.append(_str(_c(src)).alias(name))
+    if "freight_value" in dtypes:
+        extras.append(_num(_c("freight_value"), dtypes["freight_value"]).alias("x_freight_value"))
+    if "order_delivered_customer_date" in dtypes:
+        delivered = _ts(_c("order_delivered_customer_date"), dtypes["order_delivered_customer_date"])
+        extras.append(F.datediff(delivered, purchased).alias("x_delivery_days"))
+        if "order_estimated_delivery_date" in dtypes:
+            estimated = _ts(_c("order_estimated_delivery_date"), dtypes["order_estimated_delivery_date"])
+            extras.append(F.when(delivered.isNotNull(), (delivered > estimated).cast("int")).alias("x_late_delivery"))
+
+    df = joined.select(
         F.when(is_canceled, F.concat(F.lit("C"), order_id)).otherwise(order_id).alias("invoice_no"),
-        _str(F.col("product_id")).alias("stock_code"),
-        F.coalesce(category, _str(F.col("product_id"))).alias("description"),
+        _str(_c("product_id")).alias("stock_code"),
+        F.coalesce(category, _str(_c("product_id"))).alias("description"),
         F.when(is_canceled, F.lit(-1)).otherwise(F.lit(1)).alias("quantity"),
-        _ts(F.col("order_purchase_timestamp"), dtypes["order_purchase_timestamp"]).alias("invoice_date"),
-        _num(F.col("price"), dtypes["price"]).alias("unit_price"),
-        _str(F.col("customer_unique_id")).alias("customer_id"),
-        F.concat(F.lit("Brazil - "), F.coalesce(_str(F.col("customer_state")), F.lit("UNK"))).alias("country"),
+        purchased.alias("invoice_date"),
+        _num(_c("price"), dtypes["price"]).alias("unit_price"),
+        _str(_c("customer_unique_id")).alias("customer_id"),
+        F.concat(F.lit("Brazil - "), F.coalesce(_str(_c("customer_state")), F.lit("UNK"))).alias("country"),
         F.lit("purchase").alias("event_type"),
         F.coalesce(category, F.lit("general")).alias("category"),
+        status.alias("order_status"),
+        F.lit(None).cast(DoubleType()).alias("profit"),
+        F.lit(None).cast(DoubleType()).alias("discount"),
+        F.lit(None).cast(DoubleType()).alias("source_total"),
+        *extras,
     )
+    return df, tables
 
 
 def _load_instacart_folder(spark: SparkSession, folder: Path) -> DataFrame:
@@ -401,7 +573,7 @@ def _load_instacart_folder(spark: SparkSession, folder: Path) -> DataFrame:
     depts_path = folder / "departments.csv"
     if depts_path.exists():
         products = products.join(F.broadcast(_csv(spark, depts_path)), on="department_id", how="left")
-        category = F.coalesce(_str(F.col("department")), F.lit("grocery"))
+        category = F.coalesce(_str(_c("department")), F.lit("grocery"))
     else:
         category = F.lit("grocery")
 
@@ -413,14 +585,18 @@ def _load_instacart_folder(spark: SparkSession, folder: Path) -> DataFrame:
         "timestampadd(DAY, try_cast(order_number as int) * 7 + try_cast(order_dow as int), timestamp'2024-01-01 00:00:00'))"
     )
     return joined.select(
-        _str(F.col("order_id")).alias("invoice_no"),
-        _str(F.col("product_id")).alias("stock_code"),
-        F.coalesce(_str(F.col("product_name")), _str(F.col("product_id"))).alias("description"),
+        _str(_c("order_id")).alias("invoice_no"),
+        _str(_c("product_id")).alias("stock_code"),
+        F.coalesce(_str(_c("product_name")), _str(_c("product_id"))).alias("description"),
         F.lit(1).alias("quantity"),
         synthetic_ts.alias("invoice_date"),
         F.lit(4.50).alias("unit_price"),
-        _str(F.col("user_id")).alias("customer_id"),
+        _str(_c("user_id")).alias("customer_id"),
         F.lit("United States").alias("country"),
         F.lit("purchase").alias("event_type"),
         category.alias("category"),
+        F.lit(None).cast(StringType()).alias("order_status"),
+        F.lit(None).cast(DoubleType()).alias("profit"),
+        F.lit(None).cast(DoubleType()).alias("discount"),
+        F.lit(None).cast(DoubleType()).alias("source_total"),
     )

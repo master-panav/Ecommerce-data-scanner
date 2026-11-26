@@ -12,7 +12,7 @@ from typing import Dict
 from pyspark.sql import DataFrame, SparkSession, functions as F
 
 from engine.io_utils import read_parquet, write_parquet
-from engine.schemas import load_raw_dataset
+from engine.schemas import CANCEL_STATUS_RE, load_raw_dataset
 
 AUDIT_FILE = "_audit.json"
 
@@ -47,6 +47,9 @@ class PipelineAudit:
     empty_columns_removed: list = field(default_factory=list)
     malformed_quantity_rows: int = 0
     column_mapping: dict = field(default_factory=dict)
+    extra_columns: dict = field(default_factory=dict)
+    column_profile: list = field(default_factory=list)
+    status_cancellation_rows: int = 0
 
 
 def dataset_slug(dataset_name: str) -> str:
@@ -117,9 +120,8 @@ def run_medallion_etl(
         raise EmptySilverError(f"`{dataset_name}` contains no data rows.")
 
     try:
-        # Preserve clickstream events separately if REES46 (view / cart / remove_from_cart / purchase)
-        events_path_str = None
         # Clickstream (any source with view/cart/purchase events): keep all events for the funnel
+        events_path_str = None
         is_clickstream = "event_type" in prep.get("column_mapping", {}) or schema_type == "rees46_clickstream"
         if is_clickstream:
             write_parquet(
@@ -131,7 +133,9 @@ def run_medallion_etl(
         else:
             tx_df = raw_df
 
-        is_cancel = F.upper(F.coalesce(F.col("invoice_no"), F.lit(""))).startswith("C")
+        # Cancelled = UCI-style "C" invoice prefix, or an order status such as canceled/refunded/returned
+        by_status = F.coalesce(F.col("order_status").rlike(CANCEL_STATUS_RE), F.lit(False))
+        is_cancel = F.upper(F.coalesce(F.col("invoice_no"), F.lit(""))).startswith("C") | by_status
         has_customer = F.col("customer_id").isNotNull() & (F.trim(F.col("customer_id")) != "")
 
         # 2. Data Quality Profiling (single distributed aggregation pass)
@@ -143,6 +147,7 @@ def run_medallion_etl(
             F.sum(F.when(~has_customer, 1).otherwise(0)).alias("missing_cust"),
             F.sum(F.when(F.col("invoice_date").isNull(), 1).otherwise(0)).alias("null_date"),
             F.sum(F.when(F.col("quantity").isNull() | (F.col("quantity") == 0), 1).otherwise(0)).alias("bad_qty"),
+            F.sum(F.when(by_status, 1).otherwise(0)).alias("status_cancel"),
         ).collect()[0]
 
         # Exact duplicate count
@@ -159,7 +164,12 @@ def run_medallion_etl(
             .withColumn("is_cancellation", is_cancel)
             .withColumn("is_return", F.col("quantity") < 0)
             .withColumn("has_customer_id", has_customer)
-            .withColumn("line_total", F.round(F.col("quantity") * F.col("unit_price"), 2))
+            # Prefer the source's own line total (it already includes discounts); keep returns negative
+            .withColumn("line_total", F.round(F.coalesce(
+                F.when(F.col("quantity") < 0, -F.abs(F.col("source_total"))).otherwise(F.col("source_total")),
+                F.col("quantity") * F.col("unit_price"),
+            ), 2))
+            .drop("source_total")
             .withColumn("year", F.year("invoice_date"))
             .withColumn("month", F.month("invoice_date"))
             .withColumn("year_month", F.date_format("invoice_date", "yyyy-MM"))
@@ -217,6 +227,9 @@ def run_medallion_etl(
         empty_columns_removed=list(prep.get("empty_columns", [])),
         malformed_quantity_rows=int(audit_row["bad_qty"] or 0),
         column_mapping=dict(prep.get("column_mapping", {})),
+        extra_columns=dict(prep.get("extra_columns", {})),
+        column_profile=list(prep.get("column_profile", [])),
+        status_cancellation_rows=int(audit_row["status_cancel"] or 0),
     )
     save_audit(audit)
     return audit

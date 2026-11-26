@@ -2,7 +2,7 @@
 
 **Course:** Big Data Analytics and Business Intelligence — Bennett University (B.Tech)
 
-A PySpark-powered Big Data software application implementing a **Medallion Architecture (Bronze → Silver Parquet → Gold Analytics & Spark MLlib)** with an interactive 6-page workbench UI.
+A PySpark-powered Big Data software application implementing a **Medallion Architecture (Bronze → Silver Parquet → Gold Analytics & Spark MLlib)** with an interactive 7-page workbench UI.
 
 ## Supported Public Big Data Datasets
 
@@ -11,6 +11,9 @@ A PySpark-powered Big Data software application implementing a **Medallion Archi
 | **UCI Online Retail (2010–2011)** | 541,909 rows | 22.6 MB `.xlsx` | [UCI ML Repository](https://archive.ics.uci.edu/dataset/352/online+retail) |
 | **UCI Online Retail II (2009–2011)** | 1,067,371 rows | 43.5 MB `.xlsx` | [UCI ML Repository](https://archive.ics.uci.edu/ml/datasets/online+retail+II) |
 | **Olist Brazilian E-Commerce** | ~100,000+ orders (9 tables) | ~45 MB CSVs | [Kaggle](https://www.kaggle.com/datasets/olistbr/brazilian-ecommerce) |
+| **DataCo Smart Supply Chain** | ~180,000 rows × 53 columns | ~95 MB `.csv` | [Kaggle](https://www.kaggle.com/datasets/shashwatwork/dataco-smart-supply-chain-for-big-data-analysis) |
+| **Pakistan's Largest E-Commerce** | ~580,000 orders × 26 columns | ~100 MB `.csv` | [Kaggle](https://www.kaggle.com/datasets/zusmani/pakistans-largest-ecommerce-dataset) |
+| **SuperStore Sales** | ~50,000 rows × 21 columns | ~8 MB `.csv` | [Kaggle](https://www.kaggle.com/datasets/laibaanwer/superstore-sales-dataset) |
 | **REES46 Multi-Category Clickstream** | 285M events (7 months) | 1.6–2.7 GB/mo `.csv.gz` | [Kaggle](https://www.kaggle.com/datasets/mkechinov/ecommerce-behavior-data-from-multi-category-store) |
 | **Instacart Market Basket** | 3M+ orders / 30M+ items | ~700 MB CSVs | [Kaggle](https://www.kaggle.com/datasets/yasserh/instacart-online-grocery-basket-analysis-dataset) |
 
@@ -41,10 +44,15 @@ pip install -r requirements.txt
   python data_tools.py --download-uci
   ```
 - **Option C (Kaggle Big Data sets):** Place any `.csv` / `.csv.gz` (REES46) or multi-table folder (Olist / Instacart) directly inside `data_lake/bronze/`.
-- **Option D (Upload in the app):** CSV, CSV.GZ, XLSX or Parquet up to 2 GB (set in `.streamlit/config.toml`).
-  Any retail or clickstream file works as long as it has a **date column** and a **price or amount column**.
-  Columns are matched by name regardless of case, spaces or punctuation (`Invoice No`, `order_id`, `Order Date (UTC)`,
-  `Qty`, `Amount ($)`, `user_id`, `action`…); the Data Quality page shows the mapping that was used.
+- **Option D (Upload in the app):** CSV, CSV.GZ, XLSX, Parquet or the **Kaggle `.zip` as downloaded**, up to 2 GB
+  (set in `.streamlit/config.toml`). ZIPs are extracted into `data_lake/bronze/<name>/`; multi-table Olist is detected
+  as one source, other ZIPs list each data file separately.
+  Any retail, supply-chain or clickstream file works as long as it has a **date column** and a **price or amount
+  column**, however many columns it has. Columns are matched by name regardless of case, spaces or punctuation
+  (`Invoice No`, `order date (DateOrders)`, `Order Item Quantity`, `qty_ordered`, `Sub-Category`…); if no date column is
+  recognised by name, the column whose values parse as dates is used. Order status (`canceled`, `refunded`…),
+  profit and discount columns are picked up automatically, and **every other column is kept** in Silver as an `x_*`
+  attribute for the Slice & Dice Explorer. The Data Quality page shows the mapping, kept columns and a per-column profile.
 
 ### How uploaded data is cleaned before analysis
 1. **Bronze pre-clean:** BOM / blank / duplicate headers fixed, text trimmed, placeholders (`""`, `NaN`, `null`, `N/A`, `-`)
@@ -52,7 +60,9 @@ pip install -r requirements.txt
 2. **Cast-safe normalisation:** numbers with currency symbols, thousands separators or decimal commas are parsed;
    malformed numbers and dates become NULL instead of crashing (even with Spark's strict ANSI mode on).
 3. **Silver rules:** exact duplicates removed; rows with no date, no positive price or a missing/zero quantity dropped;
-   cancellations, returns and missing customer IDs flagged. Every count is shown on the Data Quality page.
+   cancellations (`C` invoice prefix or a cancelled/refunded/returned status), returns and missing customer IDs flagged.
+   Revenue uses the source's own line total when there is one (so discounts are respected). Every count is shown on
+   the Data Quality page.
 
 ### 4. Launch the Workbench
 Run from the project folder so `.streamlit/config.toml` is picked up:
@@ -89,5 +99,6 @@ with both files in `bin/`, Spark's native distributed writer is used instead.
 - `engine/pipeline.py` — Bronze → Silver ETL, full data quality audit, `Year/Month` partitioned Parquet writer, and CSV/Excel vs. Parquet read-speed benchmark.
 - `engine/analytics.py` — Gold-layer Spark SQL aggregations (Gross/Returns/Net KPIs, monthly trends, top products, country breakdown, day×hour heatmap, REES46 clickstream funnel, cross-dataset comparison).
 - `engine/ml_models.py` — Spark MLlib **RFM + K-Means** (`k=2..6`, Silhouette & Elbow evaluation, cluster profiling, churn-risk lookup) and **FP-Growth** Market Basket association rules.
-- `app.py` — 6-page interactive Streamlit + Plotly workbench with CSV export for reports.
+- `app.py` — 7-page interactive Streamlit + Plotly workbench with CSV export for reports. Page 7 is an OLAP-style
+  Slice & Dice Explorer: any measure (revenue, profit, shipping days…) by any dimension, with an optional pivot.
 - `tests/` — pytest suite covering schema detection, Excel/CSV ingestion, the full ETL, Gold analytics and MLlib models.

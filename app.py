@@ -7,7 +7,9 @@ Run with:
 from __future__ import annotations
 
 import re
+import shutil
 import traceback
+import zipfile
 from pathlib import Path
 
 import pandas as pd
@@ -21,20 +23,24 @@ from engine.analytics import (
     compare_datasets,
     compute_kpis,
     country_summary,
+    explore,
+    explorer_fields,
     filter_silver,
     monthly_trends,
+    pretty,
     shopping_heatmap,
     top_products,
 )
 from engine.ml_models import run_fpgrowth_basket, run_kmeans_segmentation
 from engine.pipeline import EmptySilverError, PipelineAudit, load_saved_audits, load_silver, run_medallion_etl
-from engine.schemas import DATASET_CATALOG, SchemaMappingError
+from engine.schemas import DATASET_CATALOG, SchemaMappingError, is_multi_table_folder
 from engine.spark_session import get_spark, get_spark_telemetry, set_shuffle_partitions
 
 APP_DIR = Path(__file__).resolve().parent
 LAKE_ROOT = APP_DIR / "data_lake"
 BRONZE_DIR = LAKE_ROOT / "bronze"
-SUPPORTED_UPLOAD_TYPES = ["csv", "gz", "xlsx", "parquet"]
+SUPPORTED_UPLOAD_TYPES = ["csv", "gz", "xlsx", "parquet", "zip"]
+DATA_SUFFIXES = {".csv", ".xlsx", ".parquet", ".gz"}
 
 st.set_page_config(
     page_title="Big Data E-Commerce Intelligence",
@@ -65,16 +71,49 @@ def init_spark():
     return get_spark()
 
 
+def _visible(item: Path) -> bool:
+    return not item.name.startswith((".", "~$", "_")) and not item.name.endswith(".part")  # hidden, Excel lock, partial
+
+
 def discover_bronze_sources() -> dict[str, Path]:
-    """List all CSV, XLSX, Parquet files and multi-table folders inside data_lake/bronze."""
+    """List data files, multi-table folders (Olist/Instacart) and Parquet folders in data_lake/bronze.
+
+    Other folders (e.g. an extracted Kaggle ZIP) are opened and each data file inside is listed separately.
+    """
     BRONZE_DIR.mkdir(parents=True, exist_ok=True)
     sources: dict[str, Path] = {}
-    for item in sorted(BRONZE_DIR.iterdir(), key=lambda x: x.name.lower()):
-        if item.name.startswith((".", "~$", "_")) or item.name.endswith(".part"):  # hidden, Excel lock, partial uploads
-            continue
-        if item.is_dir() or item.suffix.lower() in {".csv", ".xlsx", ".parquet", ".gz"}:
+    for item in sorted(filter(_visible, BRONZE_DIR.iterdir()), key=lambda x: x.name.lower()):
+        if item.is_file() and item.suffix.lower() in DATA_SUFFIXES:
             sources[item.name] = item
+        elif item.is_dir() and (is_multi_table_folder(item) or any(item.glob("*.parquet"))):
+            sources[item.name] = item
+        elif item.is_dir():
+            for f in sorted(filter(_visible, item.rglob("*")), key=lambda x: str(x).lower()):
+                if f.is_file() and f.suffix.lower() in DATA_SUFFIXES:
+                    sources[f.relative_to(BRONZE_DIR).as_posix()] = f
     return sources
+
+
+def extract_zip(zip_path: Path) -> str:
+    """Extract a Kaggle-style ZIP into a Bronze folder (guarding against path traversal)."""
+    target = BRONZE_DIR / zip_path.stem
+    if target.exists():
+        shutil.rmtree(target)
+    target.mkdir(parents=True)
+    with zipfile.ZipFile(zip_path) as zf:
+        for member in zf.infolist():
+            dest = (target / member.filename).resolve()
+            if target.resolve() not in dest.parents and dest != target.resolve():
+                raise ValueError(f"Unsafe path in ZIP: {member.filename}")
+        zf.extractall(target)
+    zip_path.unlink()
+    # A ZIP that wraps everything in one top-level folder: flatten it
+    inner = [p for p in target.iterdir() if _visible(p)]
+    if len(inner) == 1 and inner[0].is_dir():
+        for child in inner[0].iterdir():
+            child.rename(target / child.name)
+        inner[0].rmdir()
+    return target.name
 
 
 def safe_upload_name(name: str) -> str:
@@ -95,8 +134,19 @@ def save_upload(uploaded) -> str:
             fh.write(uploaded.getbuffer())
         tmp.replace(dest)
         st.session_state["last_upload_id"] = upload_id
+        if dest.suffix.lower() == ".zip":
+            try:
+                folder = extract_zip(dest)
+            except (zipfile.BadZipFile, ValueError) as exc:
+                dest.unlink(missing_ok=True)
+                st.error(f"Could not extract `{name}`: {exc}")
+                return name
+            sources = discover_bronze_sources()
+            name = folder if folder in sources else next((k for k in sources if k.startswith(folder + "/")), folder)
+            st.toast(f"Extracted `{dest.name}` into `data_lake/bronze/{folder}/`.")
+        else:
+            st.toast(f"Saved `{name}` to the Bronze layer.")
         st.session_state["bronze_choice"] = name
-        st.toast(f"Saved `{name}` to the Bronze layer.")
     return name
 
 
@@ -136,6 +186,7 @@ with st.sidebar:
             "4. RFM & K-Means Clustering",
             "5. Market Basket (FP-Growth)",
             "6. Cross-Dataset Comparison",
+            "7. Slice & Dice Explorer",
         ],
     )
 
@@ -188,10 +239,11 @@ if page == "1. Pipeline & Spark Monitor":
                 st.rerun()
         with c2:
             uploaded = st.file_uploader(
-                "Upload CSV / CSV.GZ / XLSX / Parquet",
+                "Upload CSV / CSV.GZ / XLSX / Parquet / ZIP",
                 type=SUPPORTED_UPLOAD_TYPES,
                 label_visibility="collapsed",
-                help="Files are saved into data_lake/bronze/. For multi-GB files, copy them there directly.",
+                help="Saved into data_lake/bronze/. Kaggle ZIPs are extracted (multi-table Olist works as-is). "
+                "For multi-GB files, copy them there directly.",
             )
             if uploaded is not None:
                 save_upload(uploaded)
@@ -269,7 +321,8 @@ elif page == "2. Data Quality Audit":
     audit_table = pd.DataFrame([
         {"Check": "Fully Empty Rows", "Row Count": audit.empty_rows_removed, "Handling": "Removed before processing (Bronze pre-clean)"},
         {"Check": "Fully Empty Columns", "Row Count": len(empty_cols), "Handling": "Dropped: " + (", ".join(empty_cols) if empty_cols else "none")},
-        {"Check": "Cancellation Invoices (Prefix 'C')", "Row Count": audit.cancellation_rows, "Handling": "Flagged (`is_cancellation`) for Gross vs. Net reporting"},
+        {"Check": "Cancelled / Refunded Orders", "Row Count": audit.cancellation_rows,
+         "Handling": f"Flagged (`is_cancellation`): 'C' invoice prefix or order status ({audit.status_cancellation_rows:,} by status)"},
         {"Check": "Negative Quantity / Returns", "Row Count": audit.return_rows, "Handling": "Flagged (`is_return`), excluded from completed sales"},
         {"Check": "Missing CustomerID", "Row Count": audit.missing_customer_rows, "Handling": "Kept for aggregate BI; excluded from customer RFM"},
         {"Check": "Invalid / Non-Positive Unit Price", "Row Count": audit.invalid_price_rows, "Handling": "Dropped in Silver layer"},
@@ -291,10 +344,29 @@ elif page == "2. Data Quality Audit":
         st.plotly_chart(fig, width="stretch")
 
     if audit.column_mapping:
-        st.subheader("Detected Column Mapping")
+        map_col, extra_col = st.columns(2)
+        with map_col:
+            st.subheader("Detected Column Mapping")
+            st.dataframe(
+                pd.DataFrame(list(audit.column_mapping.items()), columns=["Canonical Field", "Source Column"]),
+                width="stretch", hide_index=True,
+            )
+        with extra_col:
+            st.subheader(f"Extra Columns Kept ({len(audit.extra_columns)})")
+            st.caption("Unmapped columns are stored in Silver as `x_*` attributes for the Slice & Dice Explorer.")
+            st.dataframe(
+                pd.DataFrame(list(audit.extra_columns.items()), columns=["Silver Column", "Source Column"]),
+                width="stretch", hide_index=True, height=260,
+            )
+
+    if audit.column_profile:
+        st.subheader(f"Bronze Column Profile ({len(audit.column_profile)} columns)")
+        profile_df = pd.DataFrame(audit.column_profile).rename(columns={
+            "column": "Column", "type": "Spark Type", "non_null": "Non-Null", "null_pct": "Null %",
+            "distinct_approx": "Distinct (approx)"})
         st.dataframe(
-            pd.DataFrame(list(audit.column_mapping.items()), columns=["Canonical Field", "Source Column"]),
-            width="stretch", hide_index=True,
+            profile_df, width="stretch", hide_index=True,
+            column_config={"Null %": st.column_config.ProgressColumn("Null %", min_value=0, max_value=100, format="%.1f%%")},
         )
 
     st.subheader("Silver Parquet Sample Preview (First 20 Rows)")
@@ -314,12 +386,14 @@ elif page == "3. Sales & Market BI":
     filtered_df = filter_silver(silver_df, countries=selected_countries or None)
 
     kpis = compute_kpis(filtered_df)
-    m1, m2, m3, m4, m5 = st.columns(5)
-    m1.metric("Net Revenue", f"{kpis['net_revenue']:,.2f}")
-    m2.metric("Gross Sales", f"{kpis['gross_sales']:,.2f}")
-    m3.metric("Completed Orders", f"{kpis['orders']:,}")
-    m4.metric("Average Order Value", f"{kpis['aov']:,.2f}")
-    m5.metric("Return Rate", f"{kpis['return_rate_pct']}%")
+    cards = st.columns(6 if kpis["profit"] is not None else 5)
+    cards[0].metric("Net Revenue", f"{kpis['net_revenue']:,.2f}")
+    cards[1].metric("Gross Sales", f"{kpis['gross_sales']:,.2f}")
+    cards[2].metric("Completed Orders", f"{kpis['orders']:,}")
+    cards[3].metric("Average Order Value", f"{kpis['aov']:,.2f}")
+    cards[4].metric("Return / Cancel Rate", f"{kpis['return_rate_pct']}%")
+    if kpis["profit"] is not None:
+        cards[5].metric("Profit", f"{kpis['profit']:,.2f}", f"{kpis['profit_margin_pct']}% margin")
 
     # Clickstream funnel if REES46
     if audit.events_path:
@@ -516,3 +590,46 @@ elif page == "6. Cross-Dataset Comparison":
             comp_df = st.session_state["comp_df"]
             st.dataframe(comp_df, width="stretch", hide_index=True)
             st.download_button("Download Comparison Table (CSV)", comp_df.to_csv(index=False), "cross_dataset_comparison.csv", "text/csv")
+
+
+# ---------------- Page 7: Slice & Dice Explorer ----------------
+elif page == "7. Slice & Dice Explorer":
+    name, audit = require_active_dataset()
+    st.header(f"Slice & Dice Explorer (OLAP) — {name}")
+    st.caption("Group any measure by any dimension of the Silver table, including every extra column kept from the "
+               "source file. All aggregation runs in Spark; only the summary is collected.")
+
+    silver_df = load_silver(spark, audit.silver_path)
+    cache_key = f"explorer_fields_{name}_{audit.etl_total_sec}"
+    if cache_key not in st.session_state:
+        with st.spinner("Profiling dimensions in Spark..."):
+            st.session_state[cache_key] = explorer_fields(silver_df)
+    dims, numeric = st.session_state[cache_key]
+
+    base_measures = ["Revenue", "Orders", "Units Sold", "Customers", "Order Lines"]
+    c1, c2, c3, c4 = st.columns([1.2, 1.2, 1.2, 0.8])
+    dimension = c1.selectbox("Rows (dimension)", dims, format_func=pretty)
+    column_dim = c2.selectbox("Columns (optional pivot)", ["(none)"] + [d for d in dims if d != dimension], format_func=pretty)
+    measure = c3.selectbox("Measure", base_measures + numeric, format_func=pretty)
+    agg = c4.selectbox("Aggregation", ["Sum", "Average", "Min", "Max"], disabled=measure in base_measures)
+    completed_only = st.toggle("Completed sales only (exclude cancellations & returns)", value=True)
+
+    pivot_dim = None if column_dim == "(none)" else column_dim
+    result = explore(silver_df, dimension, measure, agg, pivot_dim, completed_only)
+    label = measure if measure in base_measures else f"{agg} of {pretty(measure)}"
+    if result.empty:
+        st.info("No rows for this selection.")
+    elif pivot_dim is None:
+        fig = px.bar(result, x=dimension, y="value", labels={dimension: pretty(dimension), "value": label})
+        fig.update_layout(height=420, xaxis_type="category")
+        st.plotly_chart(fig, width="stretch")
+        st.dataframe(result.rename(columns={dimension: pretty(dimension), "value": label}), width="stretch", hide_index=True)
+    else:
+        pivot = result.pivot_table(index=dimension, columns=pivot_dim, values="value", aggfunc="sum").fillna(0)
+        fig = px.imshow(pivot, aspect="auto", color_continuous_scale="Blues", text_auto=".3s",
+                        labels=dict(x=pretty(pivot_dim), y=pretty(dimension), color=label))
+        fig.update_layout(height=520)
+        st.plotly_chart(fig, width="stretch")
+        st.dataframe(pivot.reset_index(), width="stretch", hide_index=True)
+    if not result.empty:
+        st.download_button("Download Result (CSV)", result.to_csv(index=False), f"{name}_explorer.csv", "text/csv")

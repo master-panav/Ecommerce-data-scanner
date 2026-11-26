@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
-from typing import Dict
+import re
+from typing import Dict, List, Tuple
 
 import pandas as pd
 from pyspark.sql import DataFrame, SparkSession, functions as F
+from pyspark.sql.types import BooleanType, IntegralType, NumericType, StringType
 
 from engine.io_utils import read_parquet
 
@@ -32,7 +34,9 @@ def compute_kpis(df: DataFrame) -> Dict[str, float]:
     completed = df.filter(~F.col("is_cancellation") & ~F.col("is_return"))
     returns = df.filter(F.col("is_cancellation") | F.col("is_return"))
 
+    has_profit = "profit" in df.columns
     comp_row = completed.agg(
+        F.sum("profit").alias("profit") if has_profit else F.lit(None).alias("profit"),
         F.coalesce(F.sum("line_total"), F.lit(0.0)).alias("gross_sales"),
         F.countDistinct("invoice_no").alias("orders"),
         F.countDistinct(F.when(F.col("has_customer_id"), F.col("customer_id"))).alias("customers"),
@@ -61,6 +65,10 @@ def compute_kpis(df: DataFrame) -> Dict[str, float]:
         "units_sold": int(comp_row["units_sold"]),
         "aov": aov,
         "return_rate_pct": return_rate,
+        # None when the dataset has no profit column
+        "profit": None if comp_row["profit"] is None else round(float(comp_row["profit"]), 2),
+        "profit_margin_pct": None if comp_row["profit"] is None or gross <= 0
+        else round(float(comp_row["profit"]) / gross * 100, 2),
     }
 
 
@@ -163,9 +171,87 @@ def compare_datasets(
         "units_sold": "Units Sold",
         "aov": "Average Order Value (AOV)",
         "return_rate_pct": "Return Rate (%)",
+        "profit": "Profit",
+        "profit_margin_pct": "Profit Margin (%)",
     }
     for key, label in labels.items():
         va, vb = kpi_a[key], kpi_b[key]
+        if va is None or vb is None:
+            continue
         delta_pct = round(((vb - va) / va) * 100, 1) if va else 0.0
         rows.append({"Metric": label, name_a: va, name_b: vb, "Delta (%)": delta_pct})
     return pd.DataFrame(rows)
+
+
+# ---------------------------------------------------------------------------------------
+# Slice & dice (OLAP-style) explorer over any dimension / measure of a Silver table
+# ---------------------------------------------------------------------------------------
+TIME_DIMENSIONS = ["year", "year_month", "month", "day_of_week", "hour"]
+_EXPLORABLE = ("country", "category", "order_status", "profit", "discount")
+# Numeric identifiers / coordinates are not meaningful to sum or average
+_NOT_A_MEASURE = re.compile(r"(^|_)(id|ids|no|code|zip|zipcode|postal_code|latitude|longitude|lat|lon|lng|year|month)$")
+
+
+def pretty(column: str) -> str:
+    return column[2:].replace("_", " ").title() if column.startswith("x_") else column.replace("_", " ").title()
+
+
+def explorer_fields(df: DataFrame, max_categories: int = 300, max_numeric_codes: int = 12) -> Tuple[List[str], List[str]]:
+    """Return (dimensions, numeric measures) usable in the explorer, using one approx-distinct Spark pass.
+
+    Dimensions: calendar fields, text/boolean columns with 2..max_categories values, and small integer
+    codes (e.g. a 0/1 late-delivery flag). Measures: numeric source attributes such as profit,
+    discount or shipping days, excluding identifiers and coordinates.
+    """
+    candidates = [f for f in df.schema.fields if f.name.startswith("x_") or f.name in _EXPLORABLE]
+    dims: List[str] = []
+    numeric: List[str] = []
+    if candidates:
+        row = df.agg(*[F.approx_count_distinct(F.col(f"`{f.name}`")).alias(f"d{i}")
+                       for i, f in enumerate(candidates)]).collect()[0]
+        for i, f in enumerate(candidates):
+            distinct = row[f"d{i}"] or 0
+            if isinstance(f.dataType, (StringType, BooleanType)):
+                if 2 <= distinct <= max_categories:
+                    dims.append(f.name)
+            elif isinstance(f.dataType, NumericType):
+                if isinstance(f.dataType, IntegralType) and 2 <= distinct <= max_numeric_codes:
+                    dims.append(f.name)
+                if distinct >= 1 and not _NOT_A_MEASURE.search(f.name):
+                    numeric.append(f.name)
+    return [d for d in TIME_DIMENSIONS if d in df.columns] + dims, numeric
+
+
+def _measure_expr(measure: str, agg: str):
+    base = {
+        "Revenue": F.sum("line_total"),
+        "Orders": F.countDistinct("invoice_no"),
+        "Units Sold": F.sum("quantity"),
+        "Customers": F.countDistinct(F.when(F.col("has_customer_id"), F.col("customer_id"))),
+        "Order Lines": F.count(F.lit(1)),
+    }
+    if measure in base:
+        return base[measure]
+    col = F.col(f"`{measure}`")
+    return {"Sum": F.sum(col), "Average": F.avg(col), "Min": F.min(col), "Max": F.max(col)}[agg]
+
+
+def explore(
+    df: DataFrame,
+    dimension: str,
+    measure: str,
+    agg: str = "Sum",
+    column_dimension: str | None = None,
+    completed_only: bool = True,
+    limit: int = 25,
+) -> pd.DataFrame:
+    """Group a Silver table by one or two dimensions and aggregate one measure in Spark."""
+    data = df.filter(~F.col("is_cancellation") & ~F.col("is_return")) if completed_only else df
+    keys = [dimension] + ([column_dimension] if column_dimension and column_dimension != dimension else [])
+    out = data.groupBy(*[F.col(f"`{k}`") for k in keys]).agg(F.round(_measure_expr(measure, agg), 2).alias("value"))
+    if len(keys) == 1:
+        order = F.col(f"`{dimension}`") if dimension in TIME_DIMENSIONS else F.desc("value")
+        return out.orderBy(order).limit(limit).toPandas()
+    top = [r[0] for r in data.groupBy(F.col(f"`{dimension}`")).agg(_measure_expr(measure, agg).alias("v"))
+           .orderBy(F.desc("v")).limit(limit).collect()]
+    return out.filter(F.col(f"`{dimension}`").isin(top)).toPandas()
