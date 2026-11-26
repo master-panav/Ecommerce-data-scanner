@@ -31,6 +31,7 @@ from engine.analytics import (
     shopping_heatmap,
     top_products,
 )
+from engine.forecasting import MEASURES, cohort_analysis, forecast_monthly
 from engine.ml_models import run_fpgrowth_basket, run_kmeans_segmentation
 from engine.pipeline import EmptySilverError, PipelineAudit, load_saved_audits, load_silver, run_medallion_etl
 from engine.schemas import DATASET_CATALOG, SchemaMappingError, is_multi_table_folder
@@ -187,6 +188,7 @@ with st.sidebar:
             "5. Market Basket (FP-Growth)",
             "6. Cross-Dataset Comparison",
             "7. Slice & Dice Explorer",
+            "8. Forecasting & Cohorts",
         ],
     )
 
@@ -633,3 +635,99 @@ elif page == "7. Slice & Dice Explorer":
         st.dataframe(pivot.reset_index(), width="stretch", hide_index=True)
     if not result.empty:
         st.download_button("Download Result (CSV)", result.to_csv(index=False), f"{name}_explorer.csv", "text/csv")
+
+
+# ---------------- Page 8: Forecasting & Cohorts ----------------
+elif page == "8. Forecasting & Cohorts":
+    name, audit = require_active_dataset()
+    st.header(f"Sales Forecasting & Customer Cohorts — {name}")
+    tab_fc, tab_co = st.tabs(["Revenue Forecast (Spark MLlib)", "Cohort Retention & LTV"])
+
+    with tab_fc:
+        st.caption("Monthly totals are aggregated in Spark. Candidate models are scored on the most recent months "
+                   "(held out from training); the most accurate one is refit on all months and projected forward.")
+        f1, f2, f3 = st.columns(3)
+        fc_measure = f1.selectbox("Measure", list(MEASURES))
+        horizon = f2.slider("Months to forecast", 1, 12, 6)
+        holdout = f3.slider("Months held out for testing", 1, 6, 3)
+        fc_key = f"forecast_{name}_{fc_measure}_{horizon}_{holdout}"
+        if st.button("Run Forecast", type="primary"):
+            with st.spinner("Aggregating monthly series and training Spark MLlib models..."):
+                st.session_state[fc_key] = forecast_monthly(load_silver(spark, audit.silver_path), horizon, holdout, fc_measure)
+        fc = st.session_state.get(fc_key)
+        if not fc:
+            st.info("Choose the settings and click **Run Forecast**.")
+        elif "error" in fc:
+            st.warning(fc["error"])
+        else:
+            hist, fut, metrics = fc["history"], fc["forecast"], fc["metrics"]
+            best = metrics.iloc[0]
+            k1, k2, k3 = st.columns(3)
+            k1.metric("Selected Model", fc["best_model"])
+            k2.metric(f"Holdout RMSE ({fc['holdout_months']} months)", f"{best['RMSE']:,.2f}")
+            k3.metric("Holdout MAPE", "n/a" if pd.isna(best["MAPE (%)"]) else f"{best['MAPE (%)']:.1f}%")
+            if fc["dropped_partial_month"]:
+                st.caption(f"Excluded `{fc['dropped_partial_month']}`: the data stops part-way through that month.")
+
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(x=fut["month"].tolist() + fut["month"].tolist()[::-1],
+                                     y=fut["upper"].tolist() + fut["lower"].tolist()[::-1], fill="toself",
+                                     line=dict(width=0), opacity=0.25, name="95% interval", hoverinfo="skip"))
+            fig.add_trace(go.Scatter(x=hist["month"], y=hist["actual"], mode="lines+markers", name="Actual"))
+            if hist["fitted"].notna().any():
+                fig.add_trace(go.Scatter(x=hist["month"], y=hist["fitted"], mode="lines", name="Model fit",
+                                         line=dict(dash="dot")))
+            fig.add_trace(go.Scatter(x=hist["month"], y=hist["holdout_prediction"], mode="markers",
+                                     name="Holdout prediction", marker=dict(symbol="x", size=10)))
+            fig.add_trace(go.Scatter(x=fut["month"], y=fut["forecast"], mode="lines+markers", name="Forecast",
+                                     line=dict(dash="dash")))
+            fig.add_vrect(x0=hist["month"].iloc[-fc["holdout_months"]], x1=hist["month"].iloc[-1],
+                          opacity=0.08, line_width=0, annotation_text="holdout", annotation_position="top left")
+            fig.update_layout(height=440, xaxis_title="Month", yaxis_title=fc["measure"], hovermode="x unified")
+            st.plotly_chart(fig, width="stretch")
+
+            m1, m2 = st.columns([1, 1.2])
+            with m1:
+                st.subheader("Model Comparison (holdout)")
+                st.dataframe(metrics, width="stretch", hide_index=True)
+            with m2:
+                st.subheader("Forecast")
+                show = fut.assign(month=fut["month"].dt.strftime("%Y-%m")).round(2)
+                st.dataframe(show, width="stretch", hide_index=True)
+            st.download_button("Download Forecast (CSV)", show.to_csv(index=False), f"{name}_forecast.csv", "text/csv")
+
+    with tab_co:
+        st.caption("Customers are grouped by the month of their first completed purchase. Each cell shows how that "
+                   "cohort behaved N months later; blank cells are months after the data ends.")
+        max_periods = st.slider("Months after first purchase", 3, 24, 12)
+        co_key = f"cohorts_{name}_{max_periods}"
+        if st.button("Build Cohorts", type="primary"):
+            with st.spinner("Computing cohorts in Spark..."):
+                st.session_state[co_key] = cohort_analysis(load_silver(spark, audit.silver_path), max_periods)
+        co = st.session_state.get(co_key)
+        if not co:
+            st.info("Click **Build Cohorts** to compute retention and lifetime value.")
+        elif "error" in co:
+            st.warning(co["error"])
+        else:
+            view = st.radio("Show", ["Retention %", "Cumulative revenue per customer"], horizontal=True)
+            matrix = co["retention_pct"] if view == "Retention %" else co["ltv_per_customer"]
+            fig_c = px.imshow(matrix, aspect="auto", color_continuous_scale="Blues", text_auto=".0f",
+                              labels=dict(x="Months since first purchase", y="Cohort (first purchase)", color=view))
+            fig_c.update_layout(height=max(320, 26 * len(matrix) + 120), xaxis=dict(dtick=1))
+            st.plotly_chart(fig_c, width="stretch")
+
+            c1, c2 = st.columns(2)
+            with c1:
+                st.subheader("Average Retention Curve")
+                fig_r = px.line(co["avg_retention"], x="period", y="retention_pct", markers=True,
+                                labels={"period": "Months since first purchase", "retention_pct": "Retention %"})
+                fig_r.update_layout(height=320, xaxis=dict(dtick=1))
+                st.plotly_chart(fig_r, width="stretch")
+            with c2:
+                st.subheader("New Customers per Cohort")
+                fig_s = px.bar(co["cohort_sizes"], x="cohort", y="new_customers",
+                               labels={"cohort": "Cohort", "new_customers": "New customers"})
+                fig_s.update_layout(height=320)
+                st.plotly_chart(fig_s, width="stretch")
+            st.download_button("Download Cohort Matrix (CSV)", matrix.to_csv(), f"{name}_cohorts.csv", "text/csv")

@@ -2,7 +2,7 @@
 
 **Course:** Big Data Analytics and Business Intelligence — Bennett University (B.Tech)
 
-A PySpark-powered Big Data software application implementing a **Medallion Architecture (Bronze → Silver Parquet → Gold Analytics & Spark MLlib)** with an interactive 7-page workbench UI.
+A PySpark-powered Big Data software application implementing a **Medallion Architecture (Bronze → Silver Parquet → Gold Analytics & Spark MLlib)** with an interactive 8-page workbench UI.
 
 ## Supported Public Big Data Datasets
 
@@ -99,6 +99,9 @@ with both files in `bin/`, Spark's native distributed writer is used instead.
 - `engine/pipeline.py` — Bronze → Silver ETL, full data quality audit, `Year/Month` partitioned Parquet writer, and CSV/Excel vs. Parquet read-speed benchmark.
 - `engine/analytics.py` — Gold-layer Spark SQL aggregations (Gross/Returns/Net KPIs, monthly trends, top products, country breakdown, day×hour heatmap, REES46 clickstream funnel, cross-dataset comparison).
 - `engine/ml_models.py` — Spark MLlib **RFM + K-Means** (`k=2..6`, Silhouette & Elbow evaluation, cluster profiling, churn-risk lookup) and **FP-Growth** Market Basket association rules.
-- `app.py` — 7-page interactive Streamlit + Plotly workbench with CSV export for reports. Page 7 is an OLAP-style
+- `engine/forecasting.py` — Monthly revenue forecasting (Spark MLlib LinearRegression with trend and
+  sin/cos seasonality, back-tested against naive and seasonal-naive baselines on held-out months, 95% interval)
+  and monthly acquisition cohorts (retention % and cumulative revenue per customer).
+- `app.py` — 8-page interactive Streamlit + Plotly workbench with CSV export for reports. Page 7 is an OLAP-style
   Slice & Dice Explorer: any measure (revenue, profit, shipping days…) by any dimension, with an optional pivot.
 - `tests/` — pytest suite covering schema detection, Excel/CSV ingestion, the full ETL, Gold analytics and MLlib models.
