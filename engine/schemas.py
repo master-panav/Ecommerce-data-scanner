@@ -368,6 +368,11 @@ def _csv(spark: SparkSession, path: Path) -> DataFrame:
     return clean_bronze(read_csv(spark, path, encoding=_detect_text_encoding(path)), profile=False)[0]
 
 
+OLIST_FILE_RE = re.compile(r"^(olist_[a-z_]+|product_category_name_translation)\.csv$", re.IGNORECASE)
+OLIST_CORE_TABLES = ("olist_orders_dataset.csv", "olist_order_items_dataset.csv",
+                     "olist_customers_dataset.csv", "olist_products_dataset.csv")
+
+
 def is_multi_table_folder(p: Path) -> bool:
     return p.is_dir() and (
         (p / "olist_orders_dataset.csv").exists() or ((p / "orders.csv").exists() and (p / "products.csv").exists())
@@ -383,6 +388,19 @@ def load_raw_dataset(spark: SparkSession, path: str | Path) -> Tuple[DataFrame, 
     p = Path(path)
     if not p.exists():
         raise FileNotFoundError(f"Bronze source not found: {p}")
+
+    if p.is_file() and OLIST_FILE_RE.match(p.name):
+        # One table of the relational Olist download: load the whole set if it sits beside it
+        if all((p.parent / t).exists() for t in OLIST_CORE_TABLES):
+            df, label, report = load_raw_dataset(spark, p.parent)
+            report["column_mapping"] = {"source": f"{report['column_mapping']['source']} (selected via {p.name})"}
+            return df, label, report
+        missing = [t for t in OLIST_CORE_TABLES if not (p.parent / t).exists()]
+        raise SchemaMappingError(
+            f"`{p.name}` is one table of the Olist dataset; on its own it has no orders to analyse. "
+            f"Also upload {', '.join(missing)} (or the whole Olist ZIP). Olist files are collected in "
+            "one folder and joined automatically."
+        )
 
     if p.is_dir() and (p / "olist_orders_dataset.csv").exists():
         df, tables = _load_olist_folder(spark, p)
@@ -574,6 +592,16 @@ def _load_olist_folder(spark: SparkSession, folder: Path) -> Tuple[DataFrame, in
     )
     tables = 4
 
+    translation_path = folder / "product_category_name_translation.csv"
+    if translation_path.exists():
+        tr = _csv(spark, translation_path)
+        if {"product_category_name", "product_category_name_english"} <= set(tr.columns):
+            joined = joined.join(
+                F.broadcast(tr.select("product_category_name", "product_category_name_english")),
+                on="product_category_name", how="left",
+            )
+            tables += 1
+
     payments_path = folder / "olist_order_payments_dataset.csv"
     if payments_path.exists():
         pay = _csv(spark, payments_path)
@@ -602,6 +630,8 @@ def _load_olist_folder(spark: SparkSession, folder: Path) -> Tuple[DataFrame, in
     is_canceled = status.isin("canceled", "unavailable")
     order_id = _str(_c("order_id"))
     category = _str(_c("product_category_name")) if "product_category_name" in dtypes else F.lit(None).cast(StringType())
+    if "product_category_name_english" in dtypes:
+        category = F.coalesce(_str(_c("product_category_name_english")), category)
 
     extras = [F.col(c) for c in ("x_payment_type", "x_payment_installments", "x_review_score") if c in dtypes]
     for src, name in (("customer_city", "x_customer_city"), ("customer_state", "x_customer_state"), ("seller_id", "x_seller_id")):

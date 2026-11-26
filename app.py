@@ -34,7 +34,7 @@ from engine.analytics import (
 from engine.forecasting import MEASURES, cohort_analysis, forecast_monthly
 from engine.ml_models import run_fpgrowth_basket, run_kmeans_segmentation
 from engine.pipeline import EmptySilverError, PipelineAudit, load_saved_audits, load_silver, run_medallion_etl
-from engine.schemas import DATASET_CATALOG, SchemaMappingError, is_multi_table_folder
+from engine.schemas import OLIST_FILE_RE, DATASET_CATALOG, SchemaMappingError, is_multi_table_folder
 from engine.spark_session import get_spark, get_spark_telemetry, set_shuffle_partitions
 
 APP_DIR = Path(__file__).resolve().parent
@@ -128,14 +128,21 @@ def save_upload(uploaded) -> str:
     """Persist an uploaded file to Bronze exactly once (Streamlit reruns the script on every click)."""
     upload_id = getattr(uploaded, "file_id", None) or f"{uploaded.name}:{uploaded.size}"
     name = safe_upload_name(uploaded.name)
-    if st.session_state.get("last_upload_id") != upload_id:
-        dest = BRONZE_DIR / name
+    saved = st.session_state.setdefault("saved_upload_ids", set())
+    if upload_id not in saved:
+        # Olist ships as 9 related CSVs: collect them in one folder so they are joined as one source
+        olist_dir = BRONZE_DIR / "olist"
+        dest = (olist_dir if OLIST_FILE_RE.match(name) else BRONZE_DIR) / name
+        dest.parent.mkdir(parents=True, exist_ok=True)
         tmp = dest.with_name(dest.name + ".part")
         with open(tmp, "wb") as fh:
             fh.write(uploaded.getbuffer())
         tmp.replace(dest)
-        st.session_state["last_upload_id"] = upload_id
-        if dest.suffix.lower() == ".zip":
+        saved.add(upload_id)
+        if dest.parent == olist_dir:
+            name = "olist" if is_multi_table_folder(olist_dir) else f"olist/{name}"
+            st.toast(f"Saved `{dest.name}` to `data_lake/bronze/olist/`.")
+        elif dest.suffix.lower() == ".zip":
             try:
                 folder = extract_zip(dest)
             except (zipfile.BadZipFile, ValueError) as exc:
@@ -240,15 +247,17 @@ if page == "1. Pipeline & Spark Monitor":
                 st.success("Generated 4 sample datasets in `data_lake/bronze/`.")
                 st.rerun()
         with c2:
-            uploaded = st.file_uploader(
+            uploads = st.file_uploader(
                 "Upload CSV / CSV.GZ / XLSX / Parquet / ZIP",
                 type=SUPPORTED_UPLOAD_TYPES,
+                accept_multiple_files=True,
                 label_visibility="collapsed",
-                help="Saved into data_lake/bronze/. Kaggle ZIPs are extracted (multi-table Olist works as-is). "
-                "For multi-GB files, copy them there directly.",
+                help="Saved into data_lake/bronze/. Kaggle ZIPs are extracted; Olist CSVs can be uploaded together "
+                "and are joined automatically. For multi-GB files, copy them there directly.",
             )
-            if uploaded is not None:
+            for uploaded in uploads or []:
                 save_upload(uploaded)
+            if uploads:
                 sources = discover_bronze_sources()
 
         if sources:
