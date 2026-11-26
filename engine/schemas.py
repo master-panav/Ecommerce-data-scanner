@@ -150,14 +150,8 @@ def map_columns(df: DataFrame) -> Dict[str, str]:
 
 # --------------------------------------------------------------------------------------
 # Cast-safe conversions: malformed values become NULL instead of failing the job.
-# PySpark 4 turns on ANSI mode, where a plain cast of "apple" to a number raises.
+# Values are validated (regex / range guard) before casting, so this also holds with ANSI mode on.
 # --------------------------------------------------------------------------------------
-def _try_cast(col: Column, dtype: str) -> Column:
-    # Column.try_cast exists from PySpark 4.0 (check the class: Column.__getattr__ fakes any attribute).
-    # On 3.5 callers only pass values already validated by a regex/range guard, so a plain cast is safe.
-    return col.try_cast(dtype) if hasattr(Column, "try_cast") else col.cast(dtype)
-
-
 def _str(col: Column) -> Column:
     return F.trim(col.cast(StringType()))
 
@@ -173,7 +167,7 @@ def _num(col: Column, dtype) -> Column:
     s = _str(col)
     s = F.regexp_replace(s, r"^(-?\d+),(\d{1,2})$", "$1.$2")  # decimal comma: "12,50"
     s = F.regexp_replace(s, r"[^0-9eE+\-.]", "")  # currency symbols, thousands separators, spaces
-    return _try_cast(F.when(s.rlike(_NUMBER_RE), s), "double")
+    return F.when(s.rlike(_NUMBER_RE), s).cast(DoubleType())
 
 
 def _ts(col: Column, dtype) -> Column:
@@ -334,7 +328,7 @@ def normalize_dataframe(df: DataFrame, mapping: Dict[str, str]) -> DataFrame:
     invoice = F.coalesce(*invoice_cols) if invoice_cols else F.concat_ws("_", customer, ts.cast(StringType()))
 
     qty = _num(col("quantity"), dtype("quantity")) if "quantity" in mapping else F.lit(1.0)
-    qty_int = _try_cast(F.when(F.abs(qty) < 2_000_000_000, F.round(qty)), "int")
+    qty_int = F.when(F.abs(qty) < 2_000_000_000, F.round(qty)).cast("int")
     price = _num(col("unit_price"), dtype("unit_price")) if "unit_price" in mapping else F.lit(None).cast(DoubleType())
     if "line_total" in mapping:  # derive the unit price from a line total when no price is given
         total = _num(col("line_total"), dtype("line_total"))

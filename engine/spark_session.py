@@ -7,7 +7,7 @@ import sys
 from typing import Dict
 
 # PySpark 3.5's pandas/Arrow bridge still imports `distutils`, removed in Python 3.12.
-# setuptools ships a drop-in copy; importing it registers the shim. PySpark 4 doesn't need it.
+# setuptools ships a drop-in copy; importing it registers the shim.
 try:  # pragma: no cover - depends on interpreter version
     import distutils.version  # noqa: F401
 except ModuleNotFoundError:  # pragma: no cover
@@ -21,8 +21,8 @@ from pyspark.sql import SparkSession
 from engine.io_utils import native_hadoop_io_available
 
 
-# Same behaviour on PySpark 3.5 and 4.x. Ingestion is already cast-safe; ANSI off is a safety net so
-# a stray malformed value yields NULL instead of aborting a job (PySpark 4 turns ANSI on by default).
+# Ingestion is already cast-safe; ANSI off is a safety net so a stray malformed value yields NULL
+# instead of aborting a job.
 RUNTIME_CONF = {
     "spark.sql.session.timeZone": "UTC",  # keep source wall-clock times (REES46 is UTC)
     "spark.sql.ansi.enabled": "false",

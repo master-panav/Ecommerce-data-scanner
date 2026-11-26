@@ -1,5 +1,5 @@
-# PySpark 3.5 runs on Java 8/11/17; PySpark 4.x needs Java 17+. Both are supported.
-pyspark>=3.5.3,<5.0
+# Pinned to PySpark 3.5 (Java 8/11/17). PySpark 4.x is not used: its strict ANSI defaults broke ingestion.
+pyspark>=3.5.3,<4.0
 # Python 3.12+ removed `distutils`, which PySpark 3.5's pandas bridge still imports.
 setuptools>=69
 streamlit>=1.46.0

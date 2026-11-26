@@ -15,7 +15,7 @@ def spark():
     from engine.spark_session import get_spark
 
     session = get_spark(app_name="EcommerceWorkbenchTests", shuffle_partitions=4)
-    # Run the suite in ANSI mode (PySpark 4's default) to prove ingestion never relies on lenient casts
+    # Run the suite in strict ANSI mode to prove ingestion never relies on lenient casts
     session.conf.set("spark.sql.ansi.enabled", "true")
     yield session
     session.stop()
