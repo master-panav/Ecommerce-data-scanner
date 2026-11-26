@@ -18,3 +18,10 @@ ENV/
 # OS files
 .DS_Store
 Thumbs.db
+
+# Generated data lake outputs (rebuilt by the ETL)
+data_lake/silver/
+data_lake/bronze/*.part
+
+# Test / tooling caches
+.pytest_cache/

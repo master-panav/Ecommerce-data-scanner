@@ -1,0 +1,64 @@
+from __future__ import annotations
+
+import pandas as pd
+import pytest
+
+from engine.schemas import SchemaMappingError, _detect_text_encoding, detect_schema_type, load_raw_dataset
+
+
+@pytest.mark.parametrize(
+    "columns, expected",
+    [
+        (["InvoiceNo", "StockCode", "Description", "Quantity", "InvoiceDate", "UnitPrice", "CustomerID", "Country"], "uci_online_retail"),
+        (["Invoice", "StockCode", "Description", "Quantity", "InvoiceDate", "Price", "Customer ID", "Country"], "uci_online_retail_ii"),
+        (["event_time", "event_type", "product_id", "user_id", "user_session", "price"], "rees46_clickstream"),
+        (["invoice_no", "unit_price", "customer_id", "invoice_date"], "canonical"),
+        (["order_date", "sku", "qty", "price", "order_id"], "generic_retail"),
+    ],
+)
+def test_detect_schema_type(columns, expected):
+    assert detect_schema_type(columns) == expected
+
+
+def test_latin1_csv_is_detected(tmp_path):
+    path = tmp_path / "latin1.csv"
+    path.write_bytes("InvoiceNo,Description\n1,CAF\xc9 MUG\n".encode("latin-1"))
+    assert _detect_text_encoding(path) == "ISO-8859-1"
+
+
+def test_utf8_csv_is_detected(tmp_path):
+    path = tmp_path / "utf8.csv"
+    path.write_text("InvoiceNo,Description\n1,CAFÉ MUG\n", encoding="utf-8")
+    assert _detect_text_encoding(path) == "UTF-8"
+
+
+def test_unmappable_upload_gives_clear_error(spark, tmp_path):
+    path = tmp_path / "not_sales.csv"
+    pd.DataFrame({"name": ["a", "b"], "score": [1, 2]}).to_csv(path, index=False)
+    with pytest.raises(SchemaMappingError, match="Could not recognise the columns"):
+        load_raw_dataset(spark, path)
+
+
+def test_excel_with_mixed_invoice_column(spark, tmp_path):
+    path = tmp_path / "mixed.xlsx"
+    pd.DataFrame(
+        {
+            "InvoiceNo": [536365, "C536379", 536366],
+            "StockCode": ["85123A", 71053, "22423"],
+            "Description": ["MUG", None, "CAKESTAND"],
+            "Quantity": [6, -1, 2],
+            "InvoiceDate": pd.to_datetime(["2010-12-01 08:26", "2010-12-01 09:41", "2010-12-01 10:00"]),
+            "UnitPrice": [2.55, 27.5, 12.75],
+            "CustomerID": [17850.0, None, 13047.0],
+            "Country": ["United Kingdom", "United Kingdom", "France"],
+        }
+    ).to_excel(path, index=False)
+
+    df, schema = load_raw_dataset(spark, path)
+    rows = {r["invoice_no"]: r for r in df.collect()}
+
+    assert schema == "uci_online_retail"
+    assert set(rows) == {"536365", "C536379", "536366"}
+    assert rows["536365"]["customer_id"] == "17850"
+    assert rows["C536379"]["customer_id"] is None
+    assert rows["536366"]["invoice_date"] is not None

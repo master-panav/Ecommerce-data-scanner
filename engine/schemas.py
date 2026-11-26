@@ -9,12 +9,15 @@ work consistently across datasets:
 
 from __future__ import annotations
 
+import gzip
 from pathlib import Path
 from typing import Dict, Tuple
 
 import pandas as pd
 from pyspark.sql import DataFrame, SparkSession, functions as F
 from pyspark.sql.types import DoubleType, IntegerType, StringType
+
+from engine.io_utils import read_csv, read_parquet
 
 DATASET_CATALOG: Dict[str, Dict[str, str]] = {
     "uci_online_retail": {
@@ -73,15 +76,64 @@ def detect_schema_type(columns: list[str]) -> str:
     return "generic_retail"
 
 
+class SchemaMappingError(ValueError):
+    """Raised when an uploaded file lacks the columns needed for retail analytics."""
+
+
+# Accepted source column names (lower-cased) for each canonical field of a retail file.
+RETAIL_COLUMN_ALIASES: Dict[str, Tuple[str, ...]] = {
+    "invoice_no": ("invoiceno", "invoice", "invoice_no", "invoice_id", "transactionno", "transaction_id", "order_id", "orderid"),
+    "stock_code": ("stockcode", "stock_code", "productno", "product_id", "productid", "sku"),
+    "description": ("description", "product", "product_name", "productname", "item", "item_name"),
+    "quantity": ("quantity", "qty", "units"),
+    "invoice_date": ("invoicedate", "invoice_date", "date", "order_date", "orderdate", "transaction_date", "timestamp"),
+    "unit_price": ("unitprice", "price", "unit_price", "item_price"),
+    "customer_id": ("customerid", "customer id", "customer_id", "customerno", "user_id"),
+    "country": ("country", "region", "state"),
+    "category": ("category", "category_code", "department"),
+}
+REQUIRED_RETAIL_FIELDS = ("invoice_no", "invoice_date", "unit_price")
+
+
 def _read_excel_to_spark(spark: SparkSession, file_path: Path) -> DataFrame:
-    """Load single or multi-sheet Excel workbooks into a Spark DataFrame."""
-    excel = pd.ExcelFile(file_path, engine="openpyxl")
-    frames = [excel.parse(sheet) for sheet in excel.sheet_names]
+    """Load single or multi-sheet Excel workbooks into a Spark DataFrame.
+
+    Text/mixed columns (e.g. UCI ``InvoiceNo`` holding both 536365 and "C536379")
+    are converted to clean strings with real nulls, so Arrow can ship them to Spark.
+    """
+    sheets = pd.read_excel(file_path, sheet_name=None, engine="openpyxl")
+    frames = [df for df in sheets.values() if not df.empty]
+    if not frames:
+        raise SchemaMappingError(f"`{file_path.name}` has no non-empty sheets.")
     pdf = pd.concat(frames, ignore_index=True)
+    pdf.columns = [str(c).strip() for c in pdf.columns]
+    pdf = pdf.loc[:, ~pdf.columns.str.startswith("Unnamed")]
+
     for col in pdf.columns:
-        if pdf[col].dtype == "object":
-            pdf[col] = pdf[col].astype(str).replace({"nan": None, "None": None})
+        series = pdf[col]
+        if pd.api.types.is_datetime64_any_dtype(series) or pd.api.types.is_bool_dtype(series):
+            continue
+        if pd.api.types.is_numeric_dtype(series):
+            continue
+        pdf[col] = series.map(lambda v: None if pd.isna(v) else str(v)).astype(object)
     return spark.createDataFrame(pdf)
+
+
+def _detect_text_encoding(path: Path, sample_bytes: int = 4 * 1024 * 1024) -> str:
+    """Return UTF-8 when the file decodes cleanly, else ISO-8859-1 (UCI CSV exports use Latin-1)."""
+    opener = gzip.open if path.suffix.lower() == ".gz" else open
+    try:
+        with opener(path, "rb") as fh:
+            sample = fh.read(sample_bytes)
+    except OSError:
+        return "UTF-8"
+    try:
+        sample.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        # A multi-byte char cut off at the end of the sample is still valid UTF-8.
+        if exc.start < len(sample) - 4:
+            return "ISO-8859-1"
+    return "UTF-8"
 
 
 def load_raw_dataset(spark: SparkSession, path: str | Path) -> Tuple[DataFrame, str]:
@@ -90,6 +142,8 @@ def load_raw_dataset(spark: SparkSession, path: str | Path) -> Tuple[DataFrame, 
     Returns (normalized_spark_df, detected_schema_key).
     """
     p = Path(path)
+    if not p.exists():
+        raise FileNotFoundError(f"Bronze source not found: {p}")
 
     # Multi-table directory support (Olist or Instacart folders)
     if p.is_dir():
@@ -98,39 +152,48 @@ def load_raw_dataset(spark: SparkSession, path: str | Path) -> Tuple[DataFrame, 
         if (p / "orders.csv").exists() and (p / "products.csv").exists():
             return _load_instacart_folder(spark, p), "instacart_basket"
         # Otherwise treat directory as Parquet or multi-CSV partition folder
-        parquet_files = list(p.glob("*.parquet"))
-        if parquet_files:
-            df = spark.read.parquet(str(p))
-            schema_type = detect_schema_type(df.columns)
-            return normalize_dataframe(df, schema_type), schema_type
-        df = spark.read.option("header", "true").option("inferSchema", "true").csv(str(p))
-        schema_type = detect_schema_type(df.columns)
-        return normalize_dataframe(df, schema_type), schema_type
-
-    suffix = p.suffix.lower()
-    if suffix in {".xlsx", ".xls"}:
-        raw_df = _read_excel_to_spark(spark, p)
-    elif suffix == ".parquet":
-        raw_df = spark.read.parquet(str(p))
+        if any(p.rglob("*.parquet")):
+            raw_df = read_parquet(spark, p)
+        else:
+            raw_df = read_csv(spark, p)
     else:
-        raw_df = (
-            spark.read
-            .option("header", "true")
-            .option("inferSchema", "true")
-            .option("escape", '"')
-            .csv(str(p))
-        )
+        suffix = p.suffix.lower()
+        if suffix == ".xlsx":
+            raw_df = _read_excel_to_spark(spark, p)
+        elif suffix == ".parquet":
+            raw_df = read_parquet(spark, p)
+        elif suffix in {".csv", ".gz", ".txt"}:
+            raw_df = read_csv(spark, p, encoding=_detect_text_encoding(p))
+        else:
+            raise SchemaMappingError(f"Unsupported file type `{suffix}`. Use .csv, .csv.gz, .xlsx or .parquet.")
 
     schema_type = detect_schema_type(raw_df.columns)
+    if schema_type in {"canonical", "generic_retail"}:
+        _validate_retail_columns(raw_df.columns, p.name)
     return normalize_dataframe(raw_df, schema_type), schema_type
+
+
+def _validate_retail_columns(columns: list[str], source_name: str) -> None:
+    cols = {c.strip().lower() for c in columns}
+    missing = [f for f in REQUIRED_RETAIL_FIELDS if not cols.intersection(RETAIL_COLUMN_ALIASES[f])]
+    if missing:
+        hints = "; ".join(f"**{f}** (any of: {', '.join(RETAIL_COLUMN_ALIASES[f][:5])})" for f in missing)
+        raise SchemaMappingError(
+            f"Could not recognise the columns in `{source_name}`. Missing {hints}. "
+            f"Found columns: {', '.join(columns[:25])}."
+        )
+
+
+def _csv(spark: SparkSession, path: Path) -> DataFrame:
+    return read_csv(spark, path, encoding=_detect_text_encoding(path))
 
 
 def _load_olist_folder(spark: SparkSession, folder: Path) -> DataFrame:
     """Perform distributed Spark Joins across Olist's relational CSV tables."""
-    orders = spark.read.option("header", "true").option("inferSchema", "true").csv(str(folder / "olist_orders_dataset.csv"))
-    items = spark.read.option("header", "true").option("inferSchema", "true").csv(str(folder / "olist_order_items_dataset.csv"))
-    customers = spark.read.option("header", "true").option("inferSchema", "true").csv(str(folder / "olist_customers_dataset.csv"))
-    products = spark.read.option("header", "true").option("inferSchema", "true").csv(str(folder / "olist_products_dataset.csv"))
+    orders = _csv(spark, folder / "olist_orders_dataset.csv")
+    items = _csv(spark, folder / "olist_order_items_dataset.csv")
+    customers = _csv(spark, folder / "olist_customers_dataset.csv")
+    products = _csv(spark, folder / "olist_products_dataset.csv")
 
     joined = (
         items.join(orders, on="order_id", how="inner")
@@ -157,15 +220,15 @@ def _load_olist_folder(spark: SparkSession, folder: Path) -> DataFrame:
 
 def _load_instacart_folder(spark: SparkSession, folder: Path) -> DataFrame:
     """Perform distributed Spark Joins across Instacart basket tables."""
-    orders = spark.read.option("header", "true").option("inferSchema", "true").csv(str(folder / "orders.csv"))
+    orders = _csv(spark, folder / "orders.csv")
     prior_path = folder / "order_products__prior.csv"
     items_path = prior_path if prior_path.exists() else folder / "order_products__train.csv"
-    items = spark.read.option("header", "true").option("inferSchema", "true").csv(str(items_path))
-    products = spark.read.option("header", "true").option("inferSchema", "true").csv(str(folder / "products.csv"))
+    items = _csv(spark, items_path)
+    products = _csv(spark, folder / "products.csv")
 
     depts_path = folder / "departments.csv"
     if depts_path.exists():
-        depts = spark.read.option("header", "true").option("inferSchema", "true").csv(str(depts_path))
+        depts = _csv(spark, depts_path)
         products = products.join(F.broadcast(depts), on="department_id", how="left")
         cat_col = F.coalesce(F.col("department"), F.lit("grocery"))
     else:
@@ -218,24 +281,29 @@ def normalize_dataframe(df: DataFrame, schema_type: str) -> DataFrame:
         )
 
     # UCI Online Retail I, UCI Online Retail II, canonical, or generic retail CSV
-    raw_date = pick("invoicedate", "invoice_date", "date", "order_date").cast(StringType())
+    a = RETAIL_COLUMN_ALIASES
+    raw_date = pick(*a["invoice_date"]).cast(StringType())
     parsed_date = F.coalesce(
         F.to_timestamp(raw_date),
         F.to_timestamp(raw_date, "M/d/yyyy H:mm"),
         F.to_timestamp(raw_date, "d/M/yyyy H:mm"),
+        F.to_timestamp(raw_date, "M/d/yyyy H:mm:ss"),
+        F.to_timestamp(raw_date, "d-M-yyyy H:mm"),
         F.to_timestamp(raw_date, "yyyy-MM-dd HH:mm:ss"),
         F.to_timestamp(raw_date, "yyyy-MM-dd"),
+        F.to_timestamp(raw_date, "M/d/yyyy"),
+        F.to_timestamp(raw_date, "d/M/yyyy"),
     )
 
     return df.select(
-        pick("invoiceno", "invoice", "invoice_no", "transactionno", "order_id").cast(StringType()).alias("invoice_no"),
-        pick("stockcode", "stock_code", "productno", "product_id").cast(StringType()).alias("stock_code"),
-        F.trim(pick("description", "product", "product_name", default="Unknown").cast(StringType())).alias("description"),
-        pick("quantity", "qty", default=1).cast(IntegerType()).alias("quantity"),
+        F.trim(pick(*a["invoice_no"]).cast(StringType())).alias("invoice_no"),
+        F.trim(pick(*a["stock_code"]).cast(StringType())).alias("stock_code"),
+        F.trim(pick(*a["description"], default="Unknown").cast(StringType())).alias("description"),
+        pick(*a["quantity"], default=1).cast(DoubleType()).cast(IntegerType()).alias("quantity"),
         parsed_date.alias("invoice_date"),
-        pick("unitprice", "price", "unit_price", default=0.0).cast(DoubleType()).alias("unit_price"),
-        F.regexp_replace(pick("customerid", "customer id", "customer_id", "customerno").cast(StringType()), r"\.0$", "").alias("customer_id"),
-        F.coalesce(pick("country", default="Unknown").cast(StringType()), F.lit("Unknown")).alias("country"),
+        pick(*a["unit_price"], default=0.0).cast(DoubleType()).alias("unit_price"),
+        F.regexp_replace(F.trim(pick(*a["customer_id"]).cast(StringType())), r"\.0$", "").alias("customer_id"),
+        F.coalesce(pick(*a["country"], default="Unknown").cast(StringType()), F.lit("Unknown")).alias("country"),
         F.lower(pick("event_type", default="purchase").cast(StringType())).alias("event_type"),
-        F.coalesce(pick("category", "category_code", default="retail").cast(StringType()), F.lit("retail")).alias("category"),
+        F.coalesce(pick(*a["category"], default="retail").cast(StringType()), F.lit("retail")).alias("category"),
     )

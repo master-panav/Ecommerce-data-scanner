@@ -1,0 +1,6 @@
+[server]
+# Allow large UCI / Kaggle uploads (MB). Multi-GB REES46 files are better copied into data_lake/bronze/.
+maxUploadSize = 2048
+
+[browser]
+gatherUsageStats = false

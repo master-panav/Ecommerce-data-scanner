@@ -6,6 +6,8 @@ Run with:
 
 from __future__ import annotations
 
+import re
+import traceback
 from pathlib import Path
 
 import pandas as pd
@@ -25,12 +27,14 @@ from engine.analytics import (
     top_products,
 )
 from engine.ml_models import run_fpgrowth_basket, run_kmeans_segmentation
-from engine.pipeline import PipelineAudit, load_silver, run_medallion_etl
-from engine.schemas import DATASET_CATALOG
-from engine.spark_session import get_spark, get_spark_telemetry
+from engine.pipeline import EmptySilverError, PipelineAudit, load_saved_audits, load_silver, run_medallion_etl
+from engine.schemas import DATASET_CATALOG, SchemaMappingError
+from engine.spark_session import get_spark, get_spark_telemetry, set_shuffle_partitions
 
-LAKE_ROOT = Path("data_lake")
+APP_DIR = Path(__file__).resolve().parent
+LAKE_ROOT = APP_DIR / "data_lake"
 BRONZE_DIR = LAKE_ROOT / "bronze"
+SUPPORTED_UPLOAD_TYPES = ["csv", "gz", "xlsx", "parquet"]
 
 st.set_page_config(
     page_title="Big Data E-Commerce Intelligence",
@@ -56,28 +60,66 @@ st.markdown(
 )
 
 
-@st.cache_resource
-def init_spark(shuffle_partitions: int = 8):
-    return get_spark(shuffle_partitions=shuffle_partitions)
+@st.cache_resource(show_spinner="Starting local Spark cluster...")
+def init_spark():
+    return get_spark()
 
 
 def discover_bronze_sources() -> dict[str, Path]:
     """List all CSV, XLSX, Parquet files and multi-table folders inside data_lake/bronze."""
     BRONZE_DIR.mkdir(parents=True, exist_ok=True)
     sources: dict[str, Path] = {}
-    for item in sorted(BRONZE_DIR.iterdir()):
-        if item.name.startswith("."):
+    for item in sorted(BRONZE_DIR.iterdir(), key=lambda x: x.name.lower()):
+        if item.name.startswith((".", "~$", "_")) or item.name.endswith(".part"):  # hidden, Excel lock, partial uploads
             continue
-        if item.is_dir() or item.suffix.lower() in {".csv", ".xlsx", ".xls", ".parquet", ".gz"}:
+        if item.is_dir() or item.suffix.lower() in {".csv", ".xlsx", ".parquet", ".gz"}:
             sources[item.name] = item
     return sources
 
 
-# Session state for processed Silver datasets
+def safe_upload_name(name: str) -> str:
+    """Strip any path components and unsafe characters from an uploaded file name."""
+    base = Path(name.replace("\\", "/")).name
+    cleaned = re.sub(r"[^A-Za-z0-9._ -]+", "_", base).strip(" .")
+    return cleaned or "uploaded_dataset.csv"
+
+
+def save_upload(uploaded) -> str:
+    """Persist an uploaded file to Bronze exactly once (Streamlit reruns the script on every click)."""
+    upload_id = getattr(uploaded, "file_id", None) or f"{uploaded.name}:{uploaded.size}"
+    name = safe_upload_name(uploaded.name)
+    if st.session_state.get("last_upload_id") != upload_id:
+        dest = BRONZE_DIR / name
+        tmp = dest.with_name(dest.name + ".part")
+        with open(tmp, "wb") as fh:
+            fh.write(uploaded.getbuffer())
+        tmp.replace(dest)
+        st.session_state["last_upload_id"] = upload_id
+        st.session_state["bronze_choice"] = name
+        st.toast(f"Saved `{name}` to the Bronze layer.")
+    return name
+
+
+def run_etl_with_feedback(spark, source: Path, name: str) -> PipelineAudit | None:
+    """Run ETL and turn failures into readable messages instead of a crashed page."""
+    try:
+        with st.spinner(f"Running Spark ETL on {name}..."):
+            return run_medallion_etl(spark, source, name, LAKE_ROOT)
+    except (SchemaMappingError, EmptySilverError) as exc:
+        st.error(str(exc))
+    except Exception as exc:  # noqa: BLE001 - surface any Spark/IO failure to the user
+        first_line = (str(exc).splitlines() or [""])[0][:400]
+        st.error(f"ETL failed for `{name}`: {type(exc).__name__}: {first_line}")
+        with st.expander("Technical details"):
+            st.code(traceback.format_exc())
+    return None
+
+
+# Session state for processed Silver datasets (restored from disk after a refresh)
 if "audits" not in st.session_state:
-    st.session_state["audits"] = {}  # dataset_name -> PipelineAudit
+    st.session_state["audits"] = load_saved_audits(LAKE_ROOT)  # dataset_name -> PipelineAudit
 if "active_dataset" not in st.session_state:
-    st.session_state["active_dataset"] = None
+    st.session_state["active_dataset"] = next(iter(st.session_state["audits"]), None)
 
 
 # ---------------- Sidebar ----------------
@@ -99,7 +141,16 @@ with st.sidebar:
 
     st.divider()
     shuffle_parts = st.slider("Spark Shuffle Partitions", min_value=2, max_value=32, value=8, step=2)
-    spark = init_spark(shuffle_parts)
+    try:
+        spark = init_spark()
+    except Exception as exc:  # noqa: BLE001
+        first_line = (str(exc).splitlines() or [""])[0][:300]
+        st.error(
+            "Could not start Spark. Make sure Java 8, 11 or 17 is installed and `java -version` works."
+            f"\n\n`{type(exc).__name__}: {first_line}`"
+        )
+        st.stop()
+    set_shuffle_partitions(spark, shuffle_parts)
 
     if st.session_state["audits"]:
         names = list(st.session_state["audits"].keys())
@@ -130,34 +181,50 @@ if page == "1. Pipeline & Spark Monitor":
 
         c1, c2 = st.columns(2)
         with c1:
-            if st.button("Generate Multi-Schema Samples", use_container_width=True):
+            if st.button("Generate Multi-Schema Samples", width="stretch"):
                 with st.spinner("Generating UCI I, UCI II, REES46 & Olist sample datasets..."):
                     generate_all_samples(BRONZE_DIR)
                 st.success("Generated 4 sample datasets in `data_lake/bronze/`.")
                 st.rerun()
         with c2:
-            uploaded = st.file_uploader("Or upload CSV / XLSX", type=["csv", "xlsx", "parquet"], label_visibility="collapsed")
+            uploaded = st.file_uploader(
+                "Upload CSV / CSV.GZ / XLSX / Parquet",
+                type=SUPPORTED_UPLOAD_TYPES,
+                label_visibility="collapsed",
+                help="Files are saved into data_lake/bronze/. For multi-GB files, copy them there directly.",
+            )
             if uploaded is not None:
-                dest = BRONZE_DIR / uploaded.name
-                dest.write_bytes(uploaded.getbuffer())
-                st.success(f"Saved `{uploaded.name}` to Bronze layer.")
+                save_upload(uploaded)
                 sources = discover_bronze_sources()
 
         if sources:
-            selected_name = st.selectbox("Select Bronze Source", list(sources.keys()))
-            if st.button("Run PySpark Medallion ETL", type="primary", use_container_width=True):
-                with st.spinner(f"Running Spark ETL on {selected_name}..."):
-                    audit = run_medallion_etl(spark, sources[selected_name], selected_name, LAKE_ROOT)
-                st.session_state["audits"][selected_name] = audit
-                st.session_state["active_dataset"] = selected_name
-                st.success(f"Silver Parquet ready in {audit.etl_total_sec}s ({audit.silver_valid_rows:,} rows).")
+            names = list(sources.keys())
+            if st.session_state.get("bronze_choice") not in names:
+                st.session_state["bronze_choice"] = names[0]
+            selected_name = st.selectbox("Select Bronze Source", names, key="bronze_choice")
+            if st.button("Run PySpark Medallion ETL", type="primary", width="stretch"):
+                audit = run_etl_with_feedback(spark, sources[selected_name], selected_name)
+                if audit is not None:
+                    st.session_state["audits"][selected_name] = audit
+                    st.session_state["active_dataset"] = selected_name
+                    # Drop model results computed on an older version of this dataset
+                    stale = [k for k in st.session_state if str(k).startswith((f"kmeans_{selected_name}_", f"fp_{selected_name}"))]
+                    for key in stale:
+                        del st.session_state[key]
+                    st.session_state.pop("comp_df", None)
+                    st.session_state["etl_message"] = (
+                        f"Silver Parquet ready for `{selected_name}` in {audit.etl_total_sec}s ({audit.silver_valid_rows:,} rows)."
+                    )
+                    st.rerun()  # refresh the sidebar's dataset selector
+            if msg := st.session_state.pop("etl_message", None):
+                st.success(msg)
         else:
             st.info("No files in `data_lake/bronze/` yet. Click **Generate Multi-Schema Samples** or drop your UCI/Kaggle files there.")
 
     with col_right:
         st.subheader("Live Spark Engine Telemetry")
         telem = get_spark_telemetry(spark)
-        st.dataframe(pd.DataFrame(telem.items(), columns=["Spark Parameter", "Value"]), use_container_width=True, hide_index=True)
+        st.dataframe(pd.DataFrame(telem.items(), columns=["Spark Parameter", "Value"]), width="stretch", hide_index=True)
 
     # Benchmark summary if datasets have been processed
     if st.session_state["audits"]:
@@ -176,14 +243,14 @@ if page == "1. Pipeline & Spark Monitor":
                 "Parquet Read (s)": a.parquet_read_sec,
                 "Partitions": a.silver_partitions,
             })
-        st.dataframe(pd.DataFrame(bench_rows), use_container_width=True, hide_index=True)
+        st.dataframe(pd.DataFrame(bench_rows), width="stretch", hide_index=True)
 
     with st.expander("Supported Public Big Data Catalog (UCI & Kaggle)"):
         cat_df = pd.DataFrame([
             {"Dataset": v["name"], "Scale": v["rows"], "File Size": v["size"], "Big Data Focus": v["focus"], "Source URL": v["url"]}
             for v in DATASET_CATALOG.values()
         ])
-        st.dataframe(cat_df, use_container_width=True, hide_index=True)
+        st.dataframe(cat_df, width="stretch", hide_index=True)
 
 
 # ---------------- Page 2: Data Quality Audit ----------------
@@ -210,16 +277,16 @@ elif page == "2. Data Quality Audit":
     col_a, col_b = st.columns([1.2, 1])
     with col_a:
         st.subheader("Cleaning Audit Log")
-        st.dataframe(audit_table, use_container_width=True, hide_index=True)
+        st.dataframe(audit_table, width="stretch", hide_index=True)
     with col_b:
         st.subheader("Data Quality Issue Distribution")
         fig = px.bar(audit_table, x="Row Count", y="Check", orientation="h", text_auto=True)
         fig.update_layout(height=340, margin=dict(l=10, r=10, t=10, b=10), yaxis_title="")
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
 
     st.subheader("Silver Parquet Sample Preview (First 20 Rows)")
     silver_df = load_silver(spark, audit.silver_path)
-    st.dataframe(silver_df.limit(20).toPandas(), use_container_width=True, hide_index=True)
+    st.dataframe(silver_df.limit(20).toPandas(), width="stretch", hide_index=True)
 
 
 # ---------------- Page 3: Sales & Market BI ----------------
@@ -249,9 +316,9 @@ elif page == "3. Sales & Market BI":
         with fc1:
             fig_f = px.funnel(funnel_pdf, x="events", y="event_type", text="unique_users")
             fig_f.update_layout(height=320, margin=dict(l=10, r=10, t=10, b=10))
-            st.plotly_chart(fig_f, use_container_width=True)
+            st.plotly_chart(fig_f, width="stretch")
         with fc2:
-            st.dataframe(funnel_pdf, use_container_width=True, hide_index=True)
+            st.dataframe(funnel_pdf, width="stretch", hide_index=True)
 
     # Monthly trend
     trend_pdf = monthly_trends(filtered_df)
@@ -261,7 +328,7 @@ elif page == "3. Sales & Market BI":
     fig_trend.add_trace(go.Scatter(x=trend_pdf["year_month"], y=trend_pdf["net_revenue"], mode="lines+markers", name="Net Revenue"))
     fig_trend.add_trace(go.Bar(x=trend_pdf["year_month"], y=trend_pdf["returns"], name="Returns", opacity=0.45))
     fig_trend.update_layout(height=360, barmode="overlay", xaxis_title="Month", yaxis_title="Value")
-    st.plotly_chart(fig_trend, use_container_width=True)
+    st.plotly_chart(fig_trend, width="stretch")
 
     c_prod, c_geo = st.columns(2)
     with c_prod:
@@ -269,14 +336,14 @@ elif page == "3. Sales & Market BI":
         prod_pdf = top_products(filtered_df, limit=12)
         fig_prod = px.bar(prod_pdf.sort_values("revenue"), x="revenue", y="description", orientation="h", hover_data=["units_sold", "orders"])
         fig_prod.update_layout(height=400, yaxis_title="", xaxis_title="Revenue")
-        st.plotly_chart(fig_prod, use_container_width=True)
+        st.plotly_chart(fig_prod, width="stretch")
 
     with c_geo:
         st.subheader("Revenue by Country / Region")
         geo_pdf = country_summary(filtered_df)
         fig_geo = px.bar(geo_pdf.head(12).sort_values("revenue"), x="revenue", y="country", orientation="h", hover_data=["orders", "aov"])
         fig_geo.update_layout(height=400, yaxis_title="", xaxis_title="Revenue")
-        st.plotly_chart(fig_geo, use_container_width=True)
+        st.plotly_chart(fig_geo, width="stretch")
 
     st.subheader("Peak Shopping Activity (Day of Week × Hour)")
     heat_pdf = shopping_heatmap(filtered_df)
@@ -286,7 +353,7 @@ elif page == "3. Sales & Market BI":
         pivot = pivot.reindex([d for d in day_order if d in pivot.index])
         fig_h = px.imshow(pivot, aspect="auto", color_continuous_scale="Blues", labels=dict(x="Hour of Day", y="Day", color="Orders"))
         fig_h.update_layout(height=320)
-        st.plotly_chart(fig_h, use_container_width=True)
+        st.plotly_chart(fig_h, width="stretch")
 
     st.download_button("Download Monthly BI Summary (CSV)", trend_pdf.to_csv(index=False), f"{name}_monthly_bi.csv", "text/csv")
 
@@ -320,15 +387,15 @@ elif page == "4. RFM & K-Means Clustering":
             st.subheader("Silhouette Score by k (Higher = Better Separation)")
             fig_sil = px.line(eval_df, x="k", y="silhouette", markers=True)
             fig_sil.update_layout(height=300, xaxis=dict(dtick=1))
-            st.plotly_chart(fig_sil, use_container_width=True)
+            st.plotly_chart(fig_sil, width="stretch")
         with ec2:
             st.subheader("Elbow Curve (WSSSE Training Cost)")
             fig_elb = px.line(eval_df, x="k", y="wssse", markers=True)
             fig_elb.update_layout(height=300, xaxis=dict(dtick=1))
-            st.plotly_chart(fig_elb, use_container_width=True)
+            st.plotly_chart(fig_elb, width="stretch")
 
         st.subheader("Cluster Profiles (Observed Means)")
-        st.dataframe(prof_df[["cluster", "segment", "customers", "share_pct", "avg_recency", "avg_frequency", "avg_monetary", "total_revenue"]], use_container_width=True, hide_index=True)
+        st.dataframe(prof_df[["cluster", "segment", "customers", "share_pct", "avg_recency", "avg_frequency", "avg_monetary", "total_revenue"]], width="stretch", hide_index=True)
 
         st.subheader("3D RFM Cluster Visualization")
         sample_plot = cust_df.sample(min(len(cust_df), 4000), random_state=42)
@@ -342,13 +409,13 @@ elif page == "4. RFM & K-Means Clustering":
             hover_data=["customer_id", "churn_risk"],
         )
         fig_3d.update_layout(height=480, margin=dict(l=0, r=0, t=10, b=0))
-        st.plotly_chart(fig_3d, use_container_width=True)
+        st.plotly_chart(fig_3d, width="stretch")
 
         st.subheader("Individual Customer Lookup & Churn Risk")
         search_id = st.text_input("Enter Customer ID (partial or exact)")
         if search_id:
-            matches = cust_df[cust_df["customer_id"].astype(str).str.contains(search_id.strip(), case=False, na=False)].head(25)
-            st.dataframe(matches, use_container_width=True, hide_index=True)
+            matches = cust_df[cust_df["customer_id"].astype(str).str.contains(search_id.strip(), case=False, na=False, regex=False)].head(25)
+            st.dataframe(matches, width="stretch", hide_index=True)
 
         st.download_button("Download Customer Segments (CSV)", cust_df.to_csv(index=False), f"{name}_rfm_segments.csv", "text/csv")
 
@@ -379,8 +446,14 @@ elif page == "5. Market Basket (FP-Growth)":
             st.warning("No rules found at these thresholds. Lower Minimum Support or Confidence and try again.")
         else:
             item_filter = st.text_input("Filter rules by product name")
-            view_df = rules_df[rules_df["If Customer Buys"].str.contains(item_filter, case=False, na=False)] if item_filter else rules_df
-            st.dataframe(view_df, use_container_width=True, hide_index=True)
+            if item_filter:
+                mask = rules_df["If Customer Buys"].str.contains(item_filter, case=False, na=False, regex=False) | rules_df[
+                    "Also Likely To Buy"
+                ].str.contains(item_filter, case=False, na=False, regex=False)
+                view_df = rules_df[mask]
+            else:
+                view_df = rules_df
+            st.dataframe(view_df, width="stretch", hide_index=True)
 
             fig_fp = px.scatter(
                 view_df,
@@ -392,7 +465,7 @@ elif page == "5. Market Basket (FP-Growth)":
                 color_continuous_scale="Viridis",
             )
             fig_fp.update_layout(height=380)
-            st.plotly_chart(fig_fp, use_container_width=True)
+            st.plotly_chart(fig_fp, width="stretch")
             st.download_button("Download Association Rules (CSV)", view_df.to_csv(index=False), f"{name}_fpgrowth_rules.csv", "text/csv")
 
 
@@ -417,5 +490,5 @@ elif page == "6. Cross-Dataset Comparison":
 
         if "comp_df" in st.session_state:
             comp_df = st.session_state["comp_df"]
-            st.dataframe(comp_df, use_container_width=True, hide_index=True)
+            st.dataframe(comp_df, width="stretch", hide_index=True)
             st.download_button("Download Comparison Table (CSV)", comp_df.to_csv(index=False), "cross_dataset_comparison.csv", "text/csv")

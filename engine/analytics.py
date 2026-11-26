@@ -7,6 +7,8 @@ from typing import Dict
 import pandas as pd
 from pyspark.sql import DataFrame, SparkSession, functions as F
 
+from engine.io_utils import read_parquet
+
 
 def filter_silver(
     df: DataFrame,
@@ -126,7 +128,7 @@ def shopping_heatmap(df: DataFrame) -> pd.DataFrame:
 
 def clickstream_funnel(spark: SparkSession, events_path: str) -> pd.DataFrame:
     """Compute View -> Cart -> Remove -> Purchase conversion funnel for REES46 datasets."""
-    ev = spark.read.parquet(events_path)
+    ev = read_parquet(spark, events_path)
     agg_df = (
         ev.groupBy("event_type")
         .agg(
