@@ -477,7 +477,7 @@ def _main_data_file_beside(dictionary_file: Path) -> Path | None:
         hits = len(described & {norm(c) for c in header})
         if hits > best_hits:
             best, best_hits = f, hits
-    return best if best_hits >= 3 else None
+    return best if described and best_hits >= min(3, len(described)) else None
 
 
 def _validate_mapping(mapping: Dict[str, str], columns: List[str], source_name: str) -> None:
