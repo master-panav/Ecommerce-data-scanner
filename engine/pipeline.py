@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import time
 from dataclasses import asdict, dataclass, fields
@@ -45,7 +46,10 @@ class PipelineAudit:
 
 
 def dataset_slug(dataset_name: str) -> str:
-    return "".join(c if c.isalnum() else "_" for c in dataset_name.lower()).strip("_") or "dataset"
+    """Filesystem-safe, collision-free folder name ("Sales.csv" and "sales csv" must not share a Silver table)."""
+    readable = "".join(c if c.isascii() and c.isalnum() else "_" for c in dataset_name.lower()).strip("_")[:60] or "dataset"
+    digest = hashlib.sha1(dataset_name.encode("utf-8")).hexdigest()[:8]
+    return f"{readable}_{digest}"
 
 
 def _dir_size_mb(path: Path) -> float:
@@ -69,8 +73,14 @@ def load_saved_audits(lake_root: str | Path = "data_lake") -> Dict[str, Pipeline
             audit = PipelineAudit(**{k: v for k, v in data.items() if k in known})
         except (OSError, ValueError, TypeError):
             continue
-        if Path(audit.silver_path).exists():
-            audits[audit.dataset_name] = audit
+        # Re-anchor paths to where the audit file actually is, so moving/renaming the
+        # project folder doesn't orphan previously processed datasets.
+        silver_dir = audit_file.parent
+        audit.silver_path = str(silver_dir)
+        if audit.events_path:
+            events_dir = silver_dir.parent / Path(audit.events_path).name
+            audit.events_path = str(events_dir) if events_dir.exists() else None
+        audits[audit.dataset_name] = audit
     return audits
 
 

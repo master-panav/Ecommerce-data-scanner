@@ -295,14 +295,19 @@ def normalize_dataframe(df: DataFrame, schema_type: str) -> DataFrame:
         F.to_timestamp(raw_date, "d/M/yyyy"),
     )
 
+    def id_str(col):
+        # Numeric IDs read as floats (Excel columns with blanks, or CSV inference) become "536365.0";
+        # normalise them back to "536365" so invoices, products and customers group correctly.
+        return F.regexp_replace(F.trim(col.cast(StringType())), r"^(-?\d+)\.0+$", "$1")
+
     return df.select(
-        F.trim(pick(*a["invoice_no"]).cast(StringType())).alias("invoice_no"),
-        F.trim(pick(*a["stock_code"]).cast(StringType())).alias("stock_code"),
+        id_str(pick(*a["invoice_no"])).alias("invoice_no"),
+        id_str(pick(*a["stock_code"])).alias("stock_code"),
         F.trim(pick(*a["description"], default="Unknown").cast(StringType())).alias("description"),
         pick(*a["quantity"], default=1).cast(DoubleType()).cast(IntegerType()).alias("quantity"),
         parsed_date.alias("invoice_date"),
         pick(*a["unit_price"], default=0.0).cast(DoubleType()).alias("unit_price"),
-        F.regexp_replace(F.trim(pick(*a["customer_id"]).cast(StringType())), r"\.0$", "").alias("customer_id"),
+        id_str(pick(*a["customer_id"])).alias("customer_id"),
         F.coalesce(pick(*a["country"], default="Unknown").cast(StringType()), F.lit("Unknown")).alias("country"),
         F.lower(pick("event_type", default="purchase").cast(StringType())).alias("event_type"),
         F.coalesce(pick(*a["category"], default="retail").cast(StringType()), F.lit("retail")).alias("category"),

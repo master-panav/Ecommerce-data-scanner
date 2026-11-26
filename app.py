@@ -432,9 +432,17 @@ elif page == "5. Market Basket (FP-Growth)":
     if st.button("Run Spark FP-Growth Mining", type="primary"):
         with st.spinner("Mining frequent itemsets & association rules in Spark..."):
             silver_df = load_silver(spark, audit.silver_path)
-            st.session_state[f"fp_{name}"] = run_fpgrowth_basket(silver_df, min_support=min_sup, min_confidence=min_conf)
+            res = run_fpgrowth_basket(silver_df, min_support=min_sup, min_confidence=min_conf)
+            res["params"] = (min_sup, min_conf)
+            st.session_state[f"fp_{name}"] = res
 
     fp_res = st.session_state.get(f"fp_{name}")
+    if fp_res and fp_res.get("params") != (min_sup, min_conf):
+        run_sup, run_conf = fp_res.get("params", (None, None))
+        st.info(
+            f"Showing results for support={run_sup}, confidence={run_conf}. "
+            "Click **Run Spark FP-Growth Mining** to apply the new thresholds."
+        )
     if not fp_res:
         st.info("Adjust Support/Confidence and click **Run Spark FP-Growth Mining**.")
     elif "error" in fp_res:
@@ -481,14 +489,17 @@ elif page == "6. Cross-Dataset Comparison":
         ds_a = c1.selectbox("Dataset A", names, index=0)
         ds_b = c2.selectbox("Dataset B", names, index=1)
 
-        if st.button("Compare Datasets in Spark", type="primary"):
+        if ds_a == ds_b:
+            st.warning("Pick two different datasets to compare.")
+        elif st.button("Compare Datasets in Spark", type="primary"):
             with st.spinner("Running side-by-side Gold-layer comparison..."):
                 df_a = load_silver(spark, audits[ds_a].silver_path)
                 df_b = load_silver(spark, audits[ds_b].silver_path)
-                comp_df = compare_datasets(df_a, ds_a, df_b, ds_b)
-                st.session_state["comp_df"] = comp_df
+                st.session_state["comp_df"] = compare_datasets(df_a, ds_a, df_b, ds_b)
+                st.session_state["comp_pair"] = (ds_a, ds_b)
 
-        if "comp_df" in st.session_state:
+        # Only show a result that matches the currently selected pair
+        if "comp_df" in st.session_state and st.session_state.get("comp_pair") == (ds_a, ds_b):
             comp_df = st.session_state["comp_df"]
             st.dataframe(comp_df, width="stretch", hide_index=True)
             st.download_button("Download Comparison Table (CSV)", comp_df.to_csv(index=False), "cross_dataset_comparison.csv", "text/csv")

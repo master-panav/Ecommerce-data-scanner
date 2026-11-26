@@ -39,11 +39,15 @@ def get_spark(app_name: str = "EcommerceBigDataWorkbench", shuffle_partitions: i
         .config("spark.sql.execution.arrow.pyspark.fallback.enabled", "true")
         .config("spark.sql.parquet.compression.codec", "snappy")
         .config("spark.sql.adaptive.enabled", "true")
+        # Keep wall-clock times exactly as written in the source (REES46 is UTC) instead of
+        # shifting them into the machine's local timezone, which skewed the hour heatmap.
+        .config("spark.sql.session.timeZone", "UTC")
         .config("spark.driver.memory", "4g")
         .config("spark.ui.showConsoleProgress", "false")
         .getOrCreate()
     )
     spark.sparkContext.setLogLevel("ERROR")
+    spark.conf.set("spark.sql.session.timeZone", "UTC")  # also applies to a reused session
     set_shuffle_partitions(spark, shuffle_partitions)
     return spark
 

@@ -171,7 +171,13 @@ def download_uci_datasets(target_dir: Path = Path("data_lake/bronze")) -> None:
             print(f"[skip] {dest} already exists.")
             continue
         print(f"[downloading] {url} -> {dest}")
-        urllib.request.urlretrieve(url, dest)
+        # Download to a temp name first so an interrupted download isn't mistaken for a finished file.
+        partial = dest.with_name(dest.name + ".part")
+        try:
+            urllib.request.urlretrieve(url, partial)
+            partial.replace(dest)
+        finally:
+            partial.unlink(missing_ok=True)
         print(f"[done] {dest} ({dest.stat().st_size / (1024 * 1024):.1f} MB)")
 
 

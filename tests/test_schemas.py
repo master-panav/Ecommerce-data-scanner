@@ -62,3 +62,23 @@ def test_excel_with_mixed_invoice_column(spark, tmp_path):
     assert rows["536365"]["customer_id"] == "17850"
     assert rows["C536379"]["customer_id"] is None
     assert rows["536366"]["invoice_date"] is not None
+
+
+def test_excel_numeric_ids_with_blanks_are_not_floats(spark, tmp_path):
+    path = tmp_path / "blank_ids.xlsx"
+    pd.DataFrame(
+        {
+            "InvoiceNo": [536365, None, 536366],
+            "InvoiceDate": pd.to_datetime(["2011-01-01"] * 3),
+            "StockCode": [85123, 85124, None],
+            "Quantity": [1, 2, 3],
+            "UnitPrice": [1.0, 2.0, 3.0],
+            "CustomerID": [17850.0, None, 13047.0],
+            "Country": ["UK"] * 3,
+        }
+    ).to_excel(path, index=False)
+    df, _ = load_raw_dataset(spark, path)
+    rows = df.orderBy("unit_price").collect()
+    assert [r["invoice_no"] for r in rows] == ["536365", None, "536366"]
+    assert [r["stock_code"] for r in rows] == ["85123", "85124", None]
+    assert [r["customer_id"] for r in rows] == ["17850", None, "13047"]
