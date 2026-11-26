@@ -54,7 +54,7 @@ def test_excel_with_mixed_invoice_column(spark, tmp_path):
         }
     ).to_excel(path, index=False)
 
-    df, schema = load_raw_dataset(spark, path)
+    df, schema, _ = load_raw_dataset(spark, path)
     rows = {r["invoice_no"]: r for r in df.collect()}
 
     assert schema == "uci_online_retail"
@@ -77,7 +77,7 @@ def test_excel_numeric_ids_with_blanks_are_not_floats(spark, tmp_path):
             "Country": ["UK"] * 3,
         }
     ).to_excel(path, index=False)
-    df, _ = load_raw_dataset(spark, path)
+    df, _, _ = load_raw_dataset(spark, path)
     rows = df.orderBy("unit_price").collect()
     assert [r["invoice_no"] for r in rows] == ["536365", None, "536366"]
     assert [r["stock_code"] for r in rows] == ["85123", "85124", None]

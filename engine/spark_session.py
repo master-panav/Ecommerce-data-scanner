@@ -6,23 +6,28 @@ import os
 import sys
 from typing import Dict
 
-# PySpark 3.5's pandas/Arrow bridge still does `from distutils.version import LooseVersion`.
-# Python 3.12 removed distutils; setuptools ships a drop-in copy, so load it before PySpark needs it.
+# PySpark 3.5's pandas/Arrow bridge still imports `distutils`, removed in Python 3.12.
+# setuptools ships a drop-in copy; importing it registers the shim. PySpark 4 doesn't need it.
 try:  # pragma: no cover - depends on interpreter version
     import distutils.version  # noqa: F401
 except ModuleNotFoundError:  # pragma: no cover
     try:
-        import setuptools  # noqa: F401  (registers the distutils shim)
-        import distutils.version  # noqa: F401
-    except ModuleNotFoundError as exc:
-        raise ModuleNotFoundError(
-            "PySpark 3.5 needs `distutils`, which Python 3.12+ no longer bundles. "
-            "Run `pip install setuptools` (it is listed in requirements.txt)."
-        ) from exc
+        import setuptools  # noqa: F401
+    except ModuleNotFoundError:
+        pass
 
 from pyspark.sql import SparkSession
 
 from engine.io_utils import native_hadoop_io_available
+
+
+# Same behaviour on PySpark 3.5 and 4.x. Ingestion is already cast-safe; ANSI off is a safety net so
+# a stray malformed value yields NULL instead of aborting a job (PySpark 4 turns ANSI on by default).
+RUNTIME_CONF = {
+    "spark.sql.session.timeZone": "UTC",  # keep source wall-clock times (REES46 is UTC)
+    "spark.sql.ansi.enabled": "false",
+    "spark.sql.legacy.timeParserPolicy": "CORRECTED",  # no SparkUpgradeException on odd date strings
+}
 
 
 def get_spark(app_name: str = "EcommerceBigDataWorkbench", shuffle_partitions: int = 8) -> SparkSession:
@@ -39,15 +44,13 @@ def get_spark(app_name: str = "EcommerceBigDataWorkbench", shuffle_partitions: i
         .config("spark.sql.execution.arrow.pyspark.fallback.enabled", "true")
         .config("spark.sql.parquet.compression.codec", "snappy")
         .config("spark.sql.adaptive.enabled", "true")
-        # Keep wall-clock times exactly as written in the source (REES46 is UTC) instead of
-        # shifting them into the machine's local timezone, which skewed the hour heatmap.
-        .config("spark.sql.session.timeZone", "UTC")
         .config("spark.driver.memory", "4g")
         .config("spark.ui.showConsoleProgress", "false")
         .getOrCreate()
     )
     spark.sparkContext.setLogLevel("ERROR")
-    spark.conf.set("spark.sql.session.timeZone", "UTC")  # also applies to a reused session
+    for key, value in RUNTIME_CONF.items():  # also applied to a reused session
+        spark.conf.set(key, value)
     set_shuffle_partitions(spark, shuffle_partitions)
     return spark
 

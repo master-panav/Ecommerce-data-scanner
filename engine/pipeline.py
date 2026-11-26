@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import time
-from dataclasses import asdict, dataclass, fields
+from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from typing import Dict
 
@@ -43,6 +43,10 @@ class PipelineAudit:
     etl_total_sec: float
     silver_path: str
     events_path: str | None
+    empty_rows_removed: int = 0
+    empty_columns_removed: list = field(default_factory=list)
+    malformed_quantity_rows: int = 0
+    column_mapping: dict = field(default_factory=dict)
 
 
 def dataset_slug(dataset_name: str) -> str:
@@ -101,20 +105,23 @@ def run_medallion_etl(
 
     # 1. Bronze Read + Timing
     t_read = time.perf_counter()
-    raw_df, schema_type = load_raw_dataset(spark, src)
+    raw_df, schema_type, prep = load_raw_dataset(spark, src)
     raw_df = raw_df.persist()
-    raw_rows = raw_df.count()
+    empty_rows = int(prep.get("empty_rows", 0))
+    raw_rows = raw_df.count() + empty_rows
     raw_read_sec = time.perf_counter() - t_read
     raw_partitions = raw_df.rdd.getNumPartitions()
 
-    if raw_rows == 0:
+    if raw_rows == empty_rows:
         raw_df.unpersist()
         raise EmptySilverError(f"`{dataset_name}` contains no data rows.")
 
     try:
         # Preserve clickstream events separately if REES46 (view / cart / remove_from_cart / purchase)
         events_path_str = None
-        if schema_type == "rees46_clickstream":
+        # Clickstream (any source with view/cart/purchase events): keep all events for the funnel
+        is_clickstream = "event_type" in prep.get("column_mapping", {}) or schema_type == "rees46_clickstream"
+        if is_clickstream:
             write_parquet(
                 raw_df.select("event_type", "invoice_date", "stock_code", "category", "unit_price", "customer_id", "invoice_no"),
                 events_dir,
@@ -135,6 +142,7 @@ def run_medallion_etl(
             F.sum(F.when(F.col("unit_price").isNull() | (F.col("unit_price") <= 0), 1).otherwise(0)).alias("invalid_price"),
             F.sum(F.when(~has_customer, 1).otherwise(0)).alias("missing_cust"),
             F.sum(F.when(F.col("invoice_date").isNull(), 1).otherwise(0)).alias("null_date"),
+            F.sum(F.when(F.col("quantity").isNull() | (F.col("quantity") == 0), 1).otherwise(0)).alias("bad_qty"),
         ).collect()[0]
 
         # Exact duplicate count
@@ -160,11 +168,12 @@ def run_medallion_etl(
         )
 
         if silver_df.limit(1).count() == 0:
+            mapped = ", ".join(f"{k} <- {v}" for k, v in prep.get("column_mapping", {}).items())
             raise EmptySilverError(
-                f"No valid rows left after cleaning `{dataset_name}` "
-                f"({int(audit_row['null_date'] or 0):,} rows had no parseable date, "
-                f"{int(audit_row['invalid_price'] or 0):,} had no positive price). "
-                "Check that the file has date, price and quantity columns."
+                f"No valid rows left after cleaning `{dataset_name}`: of {tx_count:,} transaction rows, "
+                f"{int(audit_row['null_date'] or 0):,} had no parseable date, "
+                f"{int(audit_row['invalid_price'] or 0):,} had no positive price and "
+                f"{int(audit_row['bad_qty'] or 0):,} had a missing/zero quantity. Column mapping used: {mapped}."
             )
 
         # 4. Write Partitioned Silver Parquet Lake (partitioned by year, month)
@@ -204,6 +213,10 @@ def run_medallion_etl(
         etl_total_sec=round(time.perf_counter() - t0, 3),
         silver_path=str(silver_dir),
         events_path=events_path_str,
+        empty_rows_removed=empty_rows,
+        empty_columns_removed=list(prep.get("empty_columns", [])),
+        malformed_quantity_rows=int(audit_row["bad_qty"] or 0),
+        column_mapping=dict(prep.get("column_mapping", {})),
     )
     save_audit(audit)
     return audit

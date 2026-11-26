@@ -18,7 +18,7 @@ A PySpark-powered Big Data software application implementing a **Medallion Archi
 
 ### 1. Prerequisites
 - Python 3.10 – 3.12
-- Java 8, 11 or 17 (required by Apache Spark 3.5) — check with `java -version`
+- Java 17 for PySpark 4.x, or Java 8/11/17 for PySpark 3.5 — check with `java -version`
 
 ### 2. Install Dependencies
 ```bash
@@ -27,7 +27,7 @@ python -m venv .venv
 pip install -r requirements.txt
 ```
 
-> `requirements.txt` pins **PySpark 3.5** and **pandas < 3**, and installs **setuptools** because PySpark 3.5 still imports
+> `requirements.txt` supports **PySpark 3.5 and 4.x**, pins **pandas < 3**, and installs **setuptools** because PySpark 3.5 still imports
 > `distutils`, which Python 3.12 removed. Installing unpinned versions is what caused the
 > `ModuleNotFoundError: No module named 'distutils'` crash when a dataset was uploaded.
 
@@ -42,8 +42,17 @@ pip install -r requirements.txt
   ```
 - **Option C (Kaggle Big Data sets):** Place any `.csv` / `.csv.gz` (REES46) or multi-table folder (Olist / Instacart) directly inside `data_lake/bronze/`.
 - **Option D (Upload in the app):** CSV, CSV.GZ, XLSX or Parquet up to 2 GB (set in `.streamlit/config.toml`).
-  Any retail file works as long as it has an invoice/order id, a date and a price column — common names such as
-  `InvoiceNo` / `order_id`, `InvoiceDate` / `order_date`, `UnitPrice` / `price` are recognised automatically.
+  Any retail or clickstream file works as long as it has a **date column** and a **price or amount column**.
+  Columns are matched by name regardless of case, spaces or punctuation (`Invoice No`, `order_id`, `Order Date (UTC)`,
+  `Qty`, `Amount ($)`, `user_id`, `action`…); the Data Quality page shows the mapping that was used.
+
+### How uploaded data is cleaned before analysis
+1. **Bronze pre-clean:** BOM / blank / duplicate headers fixed, text trimmed, placeholders (`""`, `NaN`, `null`, `N/A`, `-`)
+   turned into NULL, fully empty rows and columns removed.
+2. **Cast-safe normalisation:** numbers with currency symbols, thousands separators or decimal commas are parsed;
+   malformed numbers and dates become NULL instead of crashing (works under PySpark 4's strict ANSI mode).
+3. **Silver rules:** exact duplicates removed; rows with no date, no positive price or a missing/zero quantity dropped;
+   cancellations, returns and missing customer IDs flagged. Every count is shown on the Data Quality page.
 
 ### 4. Launch the Workbench
 Run from the project folder so `.streamlit/config.toml` is picked up:
@@ -69,9 +78,10 @@ with both files in `bin/`, Spark's native distributed writer is used instead.
 | :--- | :--- |
 | `No module named 'distutils'` | `pip install -r requirements.txt` (adds setuptools, pins PySpark 3.5 / pandas < 3) |
 | `UnsatisfiedLinkError: NativeIO$Windows.access0` | Fixed in this version — update the code; no winutils needed |
-| `UnsupportedClassVersionError` / Spark won't start | You have PySpark 4.x with Java < 17. Reinstall from `requirements.txt` |
-| "Could not recognise the columns" | The file lacks an invoice/order id, date or price column — rename the header |
-| "No valid rows left after cleaning" | Dates could not be parsed or all prices were ≤ 0 |
+| `UnsupportedClassVersionError` / Spark won't start | PySpark 4.x needs Java 17+. Install Java 17, or `pip install "pyspark<4"` |
+| `CAST_INVALID_INPUT` (e.g. `'apple'` to `BIGINT`) | Fixed in this version — ingestion is cast-safe under ANSI mode |
+| "Could not recognise the columns" | The file has no date column or no price/amount column — rename the header |
+| "No valid rows left after cleaning" | The message lists how many rows lacked a date, price or quantity, and the column mapping used |
 
 ## Architecture Overview
 - `engine/io_utils.py` — Cross-platform Parquet/CSV I/O (Spark native writer, or PyArrow fallback on Windows without winutils).

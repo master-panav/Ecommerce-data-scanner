@@ -265,14 +265,20 @@ elif page == "2. Data Quality Audit":
     k3.metric("Duplicates Removed", f"{audit.duplicate_rows:,}")
     k4.metric("Parquet Compression", f"{audit.compression_ratio_pct}%")
 
+    empty_cols = audit.empty_columns_removed
     audit_table = pd.DataFrame([
+        {"Check": "Fully Empty Rows", "Row Count": audit.empty_rows_removed, "Handling": "Removed before processing (Bronze pre-clean)"},
+        {"Check": "Fully Empty Columns", "Row Count": len(empty_cols), "Handling": "Dropped: " + (", ".join(empty_cols) if empty_cols else "none")},
         {"Check": "Cancellation Invoices (Prefix 'C')", "Row Count": audit.cancellation_rows, "Handling": "Flagged (`is_cancellation`) for Gross vs. Net reporting"},
         {"Check": "Negative Quantity / Returns", "Row Count": audit.return_rows, "Handling": "Flagged (`is_return`), excluded from completed sales"},
         {"Check": "Missing CustomerID", "Row Count": audit.missing_customer_rows, "Handling": "Kept for aggregate BI; excluded from customer RFM"},
         {"Check": "Invalid / Non-Positive Unit Price", "Row Count": audit.invalid_price_rows, "Handling": "Dropped in Silver layer"},
         {"Check": "Null / Unparseable Timestamp", "Row Count": audit.null_date_rows, "Handling": "Dropped in Silver layer"},
+        {"Check": "Missing / Malformed / Zero Quantity", "Row Count": audit.malformed_quantity_rows, "Handling": "Dropped in Silver layer"},
         {"Check": "Exact Duplicate Rows", "Row Count": audit.duplicate_rows, "Handling": "Deduplicated via Spark `dropDuplicates()`"},
     ])
+    st.caption("Placeholder values such as blank, `NaN`, `null`, `N/A` are converted to NULL, and malformed numbers or "
+               "dates become NULL instead of failing the job, so they are counted in the checks below.")
 
     col_a, col_b = st.columns([1.2, 1])
     with col_a:
@@ -281,8 +287,15 @@ elif page == "2. Data Quality Audit":
     with col_b:
         st.subheader("Data Quality Issue Distribution")
         fig = px.bar(audit_table, x="Row Count", y="Check", orientation="h", text_auto=True)
-        fig.update_layout(height=340, margin=dict(l=10, r=10, t=10, b=10), yaxis_title="")
+        fig.update_layout(height=380, margin=dict(l=10, r=10, t=10, b=10), yaxis_title="")
         st.plotly_chart(fig, width="stretch")
+
+    if audit.column_mapping:
+        st.subheader("Detected Column Mapping")
+        st.dataframe(
+            pd.DataFrame(list(audit.column_mapping.items()), columns=["Canonical Field", "Source Column"]),
+            width="stretch", hide_index=True,
+        )
 
     st.subheader("Silver Parquet Sample Preview (First 20 Rows)")
     silver_df = load_silver(spark, audit.silver_path)
