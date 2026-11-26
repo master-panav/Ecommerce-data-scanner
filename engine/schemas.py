@@ -407,10 +407,77 @@ def load_raw_dataset(spark: SparkSession, path: str | Path) -> Tuple[DataFrame, 
     if not clean_df.columns:
         raise SchemaMappingError(f"`{p.name}` has no non-empty columns.")
     mapping = map_columns(clean_df)
+    if p.is_file() and _looks_like_data_dictionary(clean_df.columns) and not _has_core_fields(mapping):
+        main_file = _main_data_file_beside(p)
+        if main_file is not None:
+            df, label, report = load_raw_dataset(spark, main_file)
+            report["redirected_from"] = p.name
+            report["source_file"] = main_file.name
+            report["column_mapping"] = {
+                "source": f"{main_file.name} (auto-selected: {p.name} only describes its columns)",
+                **report.get("column_mapping", {}),
+            }
+            return df, label, report
     _validate_mapping(mapping, clean_df.columns, p.name)
     extras = extra_columns(clean_df, mapping)
     report = {"column_mapping": mapping, "extra_columns": extras, **stats}
     return normalize_dataframe(clean_df, mapping, extras), detect_schema_type(clean_df.columns), report
+
+
+_DICTIONARY_HEADERS = {"field", "fields", "column", "columns", "columnname", "fieldname", "variable",
+                       "attribute", "description", "descriptions", "meaning", "definition", "datatype", "type"}
+
+
+def _looks_like_data_dictionary(columns: List[str]) -> bool:
+    """A Kaggle 'Description*.csv' style file: a few columns such as FIELDS / DESCRIPTION."""
+    norm = {re.sub(r"[^a-z]", "", c.lower()) for c in columns}
+    return len(columns) <= 4 and len(norm & _DICTIONARY_HEADERS) >= 2
+
+
+def _has_core_fields(mapping: Dict[str, str]) -> bool:
+    return "invoice_date" in mapping and ("unit_price" in mapping or "line_total" in mapping)
+
+
+_DATA_FILE_SUFFIXES = {".csv", ".gz", ".txt", ".xlsx", ".parquet"}
+
+
+def _header_of(path: Path) -> List[str]:
+    try:
+        if path.suffix.lower() == ".xlsx":
+            return [str(c) for c in pd.read_excel(path, nrows=0).columns]
+        if path.suffix.lower() == ".parquet":
+            return []
+        return [str(c) for c in pd.read_csv(path, nrows=0, encoding=_detect_text_encoding(path)).columns]
+    except Exception:  # unreadable sibling: just not a candidate
+        return []
+
+
+def _main_data_file_beside(dictionary_file: Path) -> Path | None:
+    """The data file a Kaggle-style description file (FIELDS, DESCRIPTION) documents.
+
+    Picks the sibling whose header contains the most of the field names the dictionary lists,
+    so e.g. DataCo's DescriptionDataCoSupplyChain.csv resolves to DataCoSupplyChainDataset.csv
+    and not to tokenized_access_logs.csv.
+    """
+    def norm(s: str) -> str:
+        return re.sub(r"[^a-z0-9]", "", str(s).lower())
+
+    try:
+        described = {norm(v) for v in pd.read_csv(dictionary_file, encoding=_detect_text_encoding(dictionary_file)).iloc[:, 0].dropna()}
+    except Exception:
+        return None
+    best, best_hits = None, 0
+    for f in dictionary_file.parent.iterdir():
+        if (not f.is_file() or f == dictionary_file or f.suffix.lower() not in _DATA_FILE_SUFFIXES
+                or f.name.startswith((".", "~$", "_")) or f.name.endswith(".part")):
+            continue
+        header = _header_of(f)
+        if _looks_like_data_dictionary(header):
+            continue
+        hits = len(described & {norm(c) for c in header})
+        if hits > best_hits:
+            best, best_hits = f, hits
+    return best if best_hits >= 3 else None
 
 
 def _validate_mapping(mapping: Dict[str, str], columns: List[str], source_name: str) -> None:
@@ -419,6 +486,12 @@ def _validate_mapping(mapping: Dict[str, str], columns: List[str], source_name: 
         missing.append("a date/time column (e.g. InvoiceDate, order_date, created_at)")
     if "unit_price" not in mapping and "line_total" not in mapping:
         missing.append("a price or amount column (e.g. UnitPrice, price, total, sales)")
+    if missing and _looks_like_data_dictionary(columns):
+        raise SchemaMappingError(
+            f"`{source_name}` is a data dictionary (it describes the columns: {', '.join(columns)}), "
+            "not the dataset itself. Pick the main data file from the same download instead "
+            "(for DataCo that is DataCoSupplyChainDataset.csv)."
+        )
     if missing:
         raise SchemaMappingError(
             f"Could not recognise the columns in `{source_name}`. Missing {' and '.join(missing)}. "

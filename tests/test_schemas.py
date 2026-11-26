@@ -39,6 +39,29 @@ def test_unmappable_upload_gives_clear_error(spark, tmp_path):
         load_raw_dataset(spark, path)
 
 
+def test_lone_data_dictionary_gives_clear_error(spark, tmp_path):
+    path = tmp_path / "DescriptionDataCoSupplyChain.csv"
+    pd.DataFrame({"FIELDS": ["Type", "Days for shipping (real)"], "DESCRIPTION": ["Type of transaction", "Actual days"]}).to_csv(path, index=False)
+    with pytest.raises(SchemaMappingError, match="data dictionary"):
+        load_raw_dataset(spark, path)
+
+
+def test_data_dictionary_redirects_to_the_dataset_it_describes(spark, tmp_path):
+    fields = ["Type", "order date (DateOrders)", "Order Id", "Order Item Quantity", "Sales", "Order Customer Id", "Order Status"]
+    pd.DataFrame({"FIELDS": fields, "DESCRIPTION": ["..."] * len(fields)}).to_csv(tmp_path / "DescriptionDataCoSupplyChain.csv", index=False)
+    pd.DataFrame({
+        "Type": ["DEBIT", "CASH"], "order date (DateOrders)": ["1/31/2018 22:56", "2/1/2018 10:00"], "Order Id": [1, 2],
+        "Order Item Quantity": [1, 2], "Sales": [327.75, 99.5], "Order Customer Id": [20755, 19492], "Order Status": ["COMPLETE", "CANCELED"],
+    }).to_csv(tmp_path / "DataCoSupplyChainDataset.csv", index=False)
+    # A bigger sibling that is not the documented dataset must not be picked
+    pd.DataFrame({"Product": ["x"] * 500, "Date": ["9/1/2017 6:00"] * 500, "ip": ["1.1.1.1"] * 500}).to_csv(tmp_path / "tokenized_access_logs.csv", index=False)
+
+    df, _, report = load_raw_dataset(spark, tmp_path / "DescriptionDataCoSupplyChain.csv")
+    assert report["redirected_from"] == "DescriptionDataCoSupplyChain.csv"
+    assert report["source_file"] == "DataCoSupplyChainDataset.csv"
+    assert df.count() == 2
+
+
 def test_excel_with_mixed_invoice_column(spark, tmp_path):
     path = tmp_path / "mixed.xlsx"
     pd.DataFrame(
